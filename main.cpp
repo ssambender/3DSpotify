@@ -1,8 +1,11 @@
 #include <3ds.h>
+#include <citro2d.h>
+#include <citro3d.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <stdarg.h>
 #include <curl/curl.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -25,10 +28,13 @@ char currentSongId[128] = "";
 bool isPlaying = false;
 long currentProgressMs = 0;
 long currentDurationMs = 0;
-u64 lastSyncTime = 0; // smoothly fake-animate between 5-second refresh polls
+u64 lastSyncTime = 0;
 
-// image data
-u8* coverPixels = NULL;
+// GPU image data
+bool texLoaded = false;
+C3D_Tex albumTex;
+C2D_Image albumImg;
+Tex3DS_SubTexture albumSubTex;
 const int TARGET_IMG_SIZE = 200; 
 
 // polling timer variables
@@ -37,6 +43,9 @@ const u64 FETCH_INTERVAL = 5000;
 
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
+
+// citro2d text buffer
+C2D_TextBuf g_dynamicBuf;
 
 // ui
 struct Button {
@@ -89,13 +98,12 @@ bool extractJsonBool(const char* json, const char* key) {
     return false;
 }
 
-// extracts integers for track duration and progress
 long extractJsonLong(const char* json, const char* key) {
     char* keyPtr = strstr(json, key);
     if (!keyPtr) return 0;
     char* start = keyPtr + strlen(key);
     while(*start == ' ' || *start == ':') start++;
-    return atol(start); // atol safely stops reading when it hits a comma or bracket
+    return atol(start); 
 }
 
 void extractJsonString(const char* json, const char* key, char* output, size_t maxLen) {
@@ -172,6 +180,15 @@ void refreshSpotifyToken() {
     }
 }
 
+// 3DS hardware texture swizzling for PICA200 gpu
+u32 morton_index(u32 x, u32 y, u32 width) {
+    u32 i = (x & 7) | ((y & 7) << 8); 
+    i = (i ^ (i << 2)) & 0x1313;
+    i = (i ^ (i << 1)) & 0x1515;
+    i = (i | ((i >> 7) & 0x3E)) & 0x3F;
+    return i + ((x >> 3) * 64) + ((y >> 3) * 64 * (width >> 3));
+}
+
 void fetchCoverArt(const char* url) {
     sprintf(lastStatus, "Fetching Art...");
     
@@ -193,31 +210,53 @@ void fetchCoverArt(const char* url) {
     CURLcode res = curl_easy_perform(curl);
     if(res == CURLE_OK && chunk.size > 0) {
         
-        if (coverPixels) {
-            free(coverPixels);
-            coverPixels = NULL;
-        }
-
         int origW, origH, channels;
-        u8* rawPixels = stbi_load_from_memory((const stbi_uc*)chunk.memory, chunk.size, &origW, &origH, &channels, 3);
+        // decode to 4 channel to map to GPU VRAM
+        u8* rawPixels = stbi_load_from_memory((const stbi_uc*)chunk.memory, chunk.size, &origW, &origH, &channels, 4);
         
         if (rawPixels) {
-            coverPixels = (u8*)malloc(TARGET_IMG_SIZE * TARGET_IMG_SIZE * 3);
             
+            // ensure image is power of 2 tex
+            if (!texLoaded) {
+                C3D_TexInit(&albumTex, 256, 256, GPU_RGBA8);
+                C3D_TexSetFilter(&albumTex, GPU_LINEAR, GPU_NEAREST);
+                texLoaded = true;
+            }
+            
+            u32* vramTexData = (u32*)albumTex.data;
+            memset(vramTexData, 0, 256 * 256 * 4);
+            
+            // downscale and save to gpu memory
             for (int y = 0; y < TARGET_IMG_SIZE; y++) {
                 for (int x = 0; x < TARGET_IMG_SIZE; x++) {
                     int srcX = (x * origW) / TARGET_IMG_SIZE;
                     int srcY = (y * origH) / TARGET_IMG_SIZE;
                     
-                    int srcIdx = (srcY * origW + srcX) * 3;
-                    int dstIdx = (y * TARGET_IMG_SIZE + x) * 3;
+                    int srcIdx = (srcY * origW + srcX) * 4;
                     
-                    coverPixels[dstIdx + 0] = rawPixels[srcIdx + 0];
-                    coverPixels[dstIdx + 1] = rawPixels[srcIdx + 1];
-                    coverPixels[dstIdx + 2] = rawPixels[srcIdx + 2];
+                    u8 r = rawPixels[srcIdx + 0];
+                    u8 g = rawPixels[srcIdx + 1];
+                    u8 b = rawPixels[srcIdx + 2];
+                    u8 a = rawPixels[srcIdx + 3];
+                    
+                    // citro3d GPU_RGBA8
+                    u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+                    vramTexData[morton_index(x, y, 256)] = color;
                 }
             }
             
+            // define visual wrapper
+            albumSubTex.width = TARGET_IMG_SIZE;
+            albumSubTex.height = TARGET_IMG_SIZE;
+            
+            albumSubTex.left = 0.0f;
+            albumSubTex.top = 1.0f; 
+            albumSubTex.right = TARGET_IMG_SIZE / 256.0f;
+            albumSubTex.bottom = 1.0f - (TARGET_IMG_SIZE / 256.0f);
+
+            albumImg.tex = &albumTex;
+            albumImg.subtex = &albumSubTex;
+
             stbi_image_free(rawPixels);
             sprintf(lastStatus, "Art updated successfully");
         } else {
@@ -264,7 +303,6 @@ void fetchCurrentlyPlaying() {
             if (response_code == 200 && chunk.size > 0) {
                 isPlaying = extractJsonBool(chunk.memory, "\"is_playing\"");
                 
-                // grab time and sync local ticker info
                 currentProgressMs = extractJsonLong(chunk.memory, "\"progress_ms\"");
                 lastSyncTime = osGetTime();
 
@@ -314,8 +352,7 @@ void fetchCurrentlyPlaying() {
                         }
 
                         if (strlen(newCoverUrl) > 0) {
-                            strncpy(debugUrl, newCoverUrl, 50); 
-                            strcat(debugUrl, "...");
+                            snprintf(debugUrl, sizeof(debugUrl), "%.46s...", newCoverUrl);
                             fetchCoverArt(newCoverUrl);
                         } else {
                             strcpy(debugUrl, "None found");
@@ -389,103 +426,54 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
     }
 }
 
-void drawRect(gfxScreen_t screen, int screenW, int screenH, int startX, int startY, int width, int height, u8 r, u8 g, u8 b) {
-    u16 fbWidth, fbHeight;
-    u8* fb = gfxGetFramebuffer(screen, GFX_LEFT, &fbWidth, &fbHeight);
-    if (!fb) return;
+// draw dynamic text w/ citro2d
+void DrawText(float x, float y, float size, u32 color, const char* format, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
     
-    GSPGPU_FramebufferFormat format = gfxGetScreenFormat(screen);
-    int bytesPerPixel = (format == GSP_RGB565_OES) ? 2 : 3;
-    
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int screenX = startX + x;
-            int screenY = startY + y;
-            
-            if (screenX < 0 || screenX >= screenW || screenY < 0 || screenY >= screenH) continue;
-            
-            u32 fbPixelIndex = (screenX * screenH + ((screenH - 1) - screenY));
-            
-            if (bytesPerPixel == 3) {
-                u32 fbIndex = fbPixelIndex * 3;
-                fb[fbIndex + 0] = b; 
-                fb[fbIndex + 1] = g; 
-                fb[fbIndex + 2] = r; 
-            } else if (bytesPerPixel == 2) {
-                u32 fbIndex = fbPixelIndex * 2;
-                u16 color565 = ((b >> 3) & 0x1F) | (((g >> 2) & 0x3F) << 5) | (((r >> 3) & 0x1F) << 11);
-                fb[fbIndex + 0] = color565 & 0xFF;         
-                fb[fbIndex + 1] = (color565 >> 8) & 0xFF;  
-            }
-        }
-    }
+    C2D_Text textObj;
+    C2D_TextParse(&textObj, g_dynamicBuf, buffer);
+    C2D_TextOptimize(&textObj);
+    C2D_DrawText(&textObj, C2D_WithColor, x, y, 0.5f, size, size, color);
 }
 
-void drawBorder(gfxScreen_t screen, int screenW, int screenH, int startX, int startY, int width, int height, int thickness, u8 r, u8 g, u8 b) {
-    drawRect(screen, screenW, screenH, startX, startY, width, thickness, r, g, b); 
-    drawRect(screen, screenW, screenH, startX, startY + height - thickness, width, thickness, r, g, b); 
-    drawRect(screen, screenW, screenH, startX, startY, thickness, height, r, g, b); 
-    drawRect(screen, screenW, screenH, startX + width - thickness, startY, thickness, height, r, g, b); 
-}
-
-void drawPreScaledImage(int startX, int startY, u8* imgData) {
-    if (!imgData) return;
-    
-    u16 fbWidth, fbHeight;
-    u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fbWidth, &fbHeight);
-    if (!fb) return;
-    
-    GSPGPU_FramebufferFormat format = gfxGetScreenFormat(GFX_TOP);
-    int bytesPerPixel = (format == GSP_RGB565_OES) ? 2 : 3;
-    
-    for (int y = 0; y < TARGET_IMG_SIZE; y++) {
-        for (int x = 0; x < TARGET_IMG_SIZE; x++) {
-            int screenX = startX + x;
-            int screenY = startY + y;
-            
-            if (screenX < 0 || screenX >= 400 || screenY < 0 || screenY >= 240) continue;
-            
-            u32 imgIndex = (y * TARGET_IMG_SIZE + x) * 3;
-            u8 r = imgData[imgIndex + 0];
-            u8 g = imgData[imgIndex + 1];
-            u8 b = imgData[imgIndex + 2];
-            
-            u32 fbPixelIndex = (screenX * 240 + (239 - screenY));
-            
-            if (bytesPerPixel == 3) {
-                u32 fbIndex = fbPixelIndex * 3;
-                fb[fbIndex + 0] = b; 
-                fb[fbIndex + 1] = g; 
-                fb[fbIndex + 2] = r; 
-            } else if (bytesPerPixel == 2) {
-                u32 fbIndex = fbPixelIndex * 2;
-                u16 color565 = ((b >> 3) & 0x1F) | (((g >> 2) & 0x3F) << 5) | (((r >> 3) & 0x1F) << 11);
-                fb[fbIndex + 0] = color565 & 0xFF;         
-                fb[fbIndex + 1] = (color565 >> 8) & 0xFF;  
-            }
-        }
-    }
+// draw borders w/ citro2d
+void DrawBorderC2D(float x, float y, float w, float h, float t, u32 color) {
+    C2D_DrawRectSolid(x, y, 0.5f, w, t, color); // top
+    C2D_DrawRectSolid(x, y + h - t, 0.5f, w, t, color); // bottom
+    C2D_DrawRectSolid(x, y, 0.5f, t, h, color); // left
+    C2D_DrawRectSolid(x + w - t, y, 0.5f, t, h, color); // right
 }
 
 int main(int argc, char **argv) {
+    // init standard services
     gfxInitDefault();
-    
     u32 *socBuffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
     if(R_FAILED(socInit(socBuffer, SOC_BUFFERSIZE))) {
         printf("Failed to initialize SOC service!\n");
     }
-    
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    PrintConsole topScreen, bottomScreen;
-    consoleInit(GFX_TOP, &topScreen);
-    consoleInit(GFX_BOTTOM, &bottomScreen);
+    // init GPU and 2D graphics engine
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    C2D_Prepare();
 
-    consoleSelect(&topScreen);
-    printf("\x1b[48;2;18;18;18m\x1b[38;2;29;185;84m\x1b[2J"); 
-    
-    consoleSelect(&bottomScreen);
-    printf("\x1b[48;2;18;18;18m\x1b[38;2;29;185;84m\x1b[2J");
+    // create rendering targets for both screens
+    C3D_RenderTarget* topTarget = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    C3D_RenderTarget* bottomTarget = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+
+    // create text buffer
+    g_dynamicBuf = C2D_TextBufNew(4096);
+
+    // HEX to citro2d colors
+    u32 clrBg       = C2D_Color32(18, 18, 18, 255);    // #121212
+    u32 clrGreen    = C2D_Color32(29, 185, 84, 255);   // #1db954
+    u32 clrBtnBg    = C2D_Color32(33, 33, 33, 255);    // #212121
+    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);    // #555555
 
     refreshSpotifyToken();
     fetchCurrentlyPlaying();
@@ -513,7 +501,7 @@ int main(int argc, char **argv) {
 
                 if (isTouchInside(touch, btnPrev)) {
                     sprintf(lastStatus, "Sending: Previous...");
-                    currentProgressMs = 0; // optimistic reset to 0
+                    currentProgressMs = 0; 
                     lastSyncTime = osGetTime();
                     sendSpotifyCommand("/previous", "POST");
                     touchLock = true;
@@ -521,7 +509,7 @@ int main(int argc, char **argv) {
                 else if (isTouchInside(touch, btnPause) && isPlaying) {
                     sprintf(lastStatus, "Sending: Pause...");
                     isPlaying = false;
-                    currentProgressMs += (osGetTime() - lastSyncTime); // pause time exactly where it is
+                    currentProgressMs += (osGetTime() - lastSyncTime); 
                     lastSyncTime = osGetTime();
                     sendSpotifyCommand("/pause", "PUT");
                     touchLock = true;
@@ -529,13 +517,13 @@ int main(int argc, char **argv) {
                 else if (isTouchInside(touch, btnPlay) && !isPlaying) {
                     sprintf(lastStatus, "Sending: Play...");
                     isPlaying = true;
-                    lastSyncTime = osGetTime(); // restart local timer
+                    lastSyncTime = osGetTime(); 
                     sendSpotifyCommand("/play", "PUT");
                     touchLock = true;
                 }
                 else if (isTouchInside(touch, btnNext)) {
                     sprintf(lastStatus, "Sending: Next...");
-                    currentProgressMs = 0; // optimistic reset to 0
+                    currentProgressMs = 0; 
                     lastSyncTime = osGetTime();
                     sendSpotifyCommand("/next", "POST");
                     touchLock = true;
@@ -545,110 +533,93 @@ int main(int argc, char **argv) {
             touchLock = false;
         }
 
+        // rendering
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        C2D_TextBufClear(g_dynamicBuf); // reset text engine every frame
+
         // ============= TOP SCREEN =================
-        consoleSelect(&topScreen);
-        printf("\x1b[H\x1b[48;2;18;18;18m\x1b[38;2;29;185;84m"); 
-        
-        printf("\x1b[2;15H=== 3DSpotify ===                         \n");
+        C2D_TargetClear(topTarget, clrBg);
+        C2D_SceneBegin(topTarget);
         
         char displayToken[15] = "";
         if(strlen(currentAccessToken) > 0) {
-            strncpy(displayToken, currentAccessToken, 10);
-            strcat(displayToken, "...");
+            snprintf(displayToken, sizeof(displayToken), "%.10s...", currentAccessToken);
         } else {
             strcpy(displayToken, "None");
         }
 
-        // calculate and display the current / total time
-        char progressDisplay[32] = "[0:00 / 0:00]";
+        char progressDisplay[32] = "0:00 / 0:00";
         if (currentDurationMs > 0) {
             long displayMs = currentProgressMs;
-            
-            // interpolate time locally if playing
-            if (isPlaying) {
-                displayMs += (osGetTime() - lastSyncTime);
-            }
-            if (displayMs > currentDurationMs) displayMs = currentDurationMs; // overrun cap
+            if (isPlaying) displayMs += (osGetTime() - lastSyncTime);
+            if (displayMs > currentDurationMs) displayMs = currentDurationMs; 
 
             int p_sec = (displayMs / 1000) % 60;
             int p_min = (displayMs / 1000) / 60;
             int d_sec = (currentDurationMs / 1000) % 60;
             int d_min = (currentDurationMs / 1000) / 60;
 
-            sprintf(progressDisplay, "[%d:%02d / %d:%02d]", p_min, p_sec, d_min, d_sec);
+            sprintf(progressDisplay, "%d:%02d / %d:%02d", p_min, p_sec, d_min, d_sec);
         }
         
-        printf("\x1b[5;2HToken:  %-35s\n", displayToken);
-        printf("\x1b[8;2HStatus: %-35s\n", isPlaying ? "[> Playing]" : "[|| Paused]");
-        printf("\x1b[10;2HTime:   %-35s\n", progressDisplay);
-        printf("\x1b[12;2HSong:   %-35s\n", currentSong);
-        printf("\x1b[14;2HArtist: %-35s\n", currentArtist);
+        // render native text
+        DrawText(10, 10,  0.6f, clrGreen, "=== 3DSpotify ===");
+        DrawText(10, 35,  0.5f, clrGreen, "Token: %.18s", displayToken);
+        DrawText(10, 60,  0.5f, clrGreen, "Status: %s", isPlaying ? "> Playing" : "|| Paused");
+        DrawText(10, 85,  0.5f, clrGreen, "Time: %s", progressDisplay);
         
-        printf("\x1b[28;2HPress START to exit.");
+        // truncate song title and artist
+        DrawText(10, 110, 0.5f, clrGreen, "Song: %.22s", currentSong);
+        DrawText(10, 135, 0.5f, clrGreen, "Artist: %.22s", currentArtist);
+        
+        DrawText(10, 210, 0.5f, clrDisabled, "Press START to exit.");
 
-        if (coverPixels) {
-            drawPreScaledImage(190, 20, coverPixels);
+        // pre-swizzled text to GPU
+        if (texLoaded) {
+            C2D_DrawImageAt(albumImg, 190.0f, 20.0f, 0.5f, NULL, 1.0f, 1.0f);
         }
 
         // ============= BOTTOM SCREEN =================
-        consoleSelect(&bottomScreen);
-        printf("\x1b[H\x1b[48;2;18;18;18m\x1b[38;2;29;185;84m"); 
-        printf("\x1b[2;10H--- Controls ---\n");
-        printf("\x1b[5;2HStatus: %-30s\n", lastStatus);
-        printf("\x1b[7;2HArt URL: %-30s\n", debugUrl);
-
-        u8 actBgR = 33, actBgG = 33, actBgB = 33;
-        u8 actFgR = 29, actFgG = 185, actFgB = 84;
+        C2D_TargetClear(bottomTarget, clrBg);
+        C2D_SceneBegin(bottomTarget);
         
-        u8 disBgR = 33, disBgG = 33, disBgB = 33;
-        u8 disFgR = 85, disFgG = 85, disFgB = 85;
+        DrawText(10, 10, 0.6f, clrGreen, "--- Controls ---");
+        DrawText(10, 40, 0.5f, clrGreen, "Status: %.35s", lastStatus);
+        DrawText(10, 60, 0.5f, clrGreen, "Art URL: %.35s", debugUrl);
 
+        // render buttons
         // PREV
-        drawRect(GFX_BOTTOM, 320, 240, btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, actBgR, actBgG, actBgB);
-        drawBorder(GFX_BOTTOM, 320, 240, btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, 2, actFgR, actFgG, actFgB);
+        C2D_DrawRectSolid(btnPrev.x, btnPrev.y, 0.5f, btnPrev.width, btnPrev.height, clrBtnBg);
+        DrawBorderC2D(btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, 2.0f, clrGreen);
+        DrawText(btnPrev.x + 12, btnPrev.y + 32, 0.55f, clrGreen, btnPrev.label);
 
-        // PAUSE
-        if (isPlaying) {
-            drawRect(GFX_BOTTOM, 320, 240, btnPause.x, btnPause.y, btnPause.width, btnPause.height, actBgR, actBgG, actBgB);
-            drawBorder(GFX_BOTTOM, 320, 240, btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2, actFgR, actFgG, actFgB);
-        } else {
-            drawRect(GFX_BOTTOM, 320, 240, btnPause.x, btnPause.y, btnPause.width, btnPause.height, disBgR, disBgG, disBgB);
-            drawBorder(GFX_BOTTOM, 320, 240, btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2, disFgR, disFgG, disFgB);
-        }
+        // OAUSE
+        C2D_DrawRectSolid(btnPause.x, btnPause.y, 0.5f, btnPause.width, btnPause.height, clrBtnBg);
+        DrawBorderC2D(btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2.0f, isPlaying ? clrGreen : clrDisabled);
+        DrawText(btnPause.x + 10, btnPause.y + 32, 0.55f, isPlaying ? clrGreen : clrDisabled, btnPause.label);
 
         // PLAY
-        if (!isPlaying) {
-            drawRect(GFX_BOTTOM, 320, 240, btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, actBgR, actBgG, actBgB);
-            drawBorder(GFX_BOTTOM, 320, 240, btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2, actFgR, actFgG, actFgB);
-        } else {
-            drawRect(GFX_BOTTOM, 320, 240, btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, disBgR, disBgG, disBgB);
-            drawBorder(GFX_BOTTOM, 320, 240, btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2, disFgR, disFgG, disFgB);
-        }
+        C2D_DrawRectSolid(btnPlay.x, btnPlay.y, 0.5f, btnPlay.width, btnPlay.height, clrBtnBg);
+        DrawBorderC2D(btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2.0f, !isPlaying ? clrGreen : clrDisabled);
+        DrawText(btnPlay.x + 15, btnPlay.y + 32, 0.55f, !isPlaying ? clrGreen : clrDisabled, btnPlay.label);
 
         // NEXT
-        drawRect(GFX_BOTTOM, 320, 240, btnNext.x, btnNext.y, btnNext.width, btnNext.height, actBgR, actBgG, actBgB);
-        drawBorder(GFX_BOTTOM, 320, 240, btnNext.x, btnNext.y, btnNext.width, btnNext.height, 2, actFgR, actFgG, actFgB);
+        C2D_DrawRectSolid(btnNext.x, btnNext.y, 0.5f, btnNext.width, btnNext.height, clrBtnBg);
+        DrawBorderC2D(btnNext.x, btnNext.y, btnNext.width, btnNext.height, 2.0f, clrGreen);
+        DrawText(btnNext.x + 15, btnNext.y + 32, 0.55f, clrGreen, btnNext.label);
 
-        printf("\x1b[48;2;33;33;33m\x1b[38;2;29;185;84m\x1b[20;4HPrev");
-        
-        if (isPlaying) printf("\x1b[48;2;33;33;33m\x1b[38;2;29;185;84m\x1b[20;13HPause");
-        else           printf("\x1b[48;2;33;33;33m\x1b[38;2;85;85;85m\x1b[20;13HPause");
-
-        if (!isPlaying) printf("\x1b[48;2;33;33;33m\x1b[38;2;29;185;84m\x1b[20;23HPlay");
-        else            printf("\x1b[48;2;33;33;33m\x1b[38;2;85;85;85m\x1b[20;23HPlay");
-
-        printf("\x1b[48;2;33;33;33m\x1b[38;2;29;185;84m\x1b[20;32HNext");
-
-        printf("\x1b[48;2;18;18;18m"); 
-
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        C3D_FrameEnd(0);
     }
 
-    if (coverPixels) {
-        free(coverPixels); 
+    if (texLoaded) {
+        C3D_TexDelete(&albumTex); 
     }
+    
+    // clean up graphics engines
+    C2D_TextBufDelete(g_dynamicBuf);
+    C2D_Fini();
+    C3D_Fini();
+    
     curl_global_cleanup();
     socExit();
     free(socBuffer);
