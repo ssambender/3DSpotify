@@ -5,6 +5,9 @@
 #include <malloc.h>
 #include <curl/curl.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 // spotify api info
 const char* CLIENT_ID = "a";
 const char* CLIENT_SECRET = "b";
@@ -13,17 +16,23 @@ const char* REFRESH_TOKEN = "c";
 // global vars
 char currentAccessToken[512] = "";
 char lastStatus[256] = "Booting up...";
+char debugUrl[128] = "No URL yet";
 
 // playback data
 char currentSong[128] = "Loading...";
 char currentArtist[128] = "Loading...";
+char currentSongId[128] = ""; 
 bool isPlaying = false;
+
+// image data
+u8* coverPixels = NULL;
+int coverWidth = 0;
+int coverHeight = 0;
 
 // polling timer variables
 u64 lastFetchTime = 0;
 const u64 FETCH_INTERVAL = 5000; // 5 seconds
 
-// network socket buffer size
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
 
@@ -33,7 +42,6 @@ struct Button {
     const char* label;
 };
 
-// place buttons on bottom screen
 Button btnPrev  = { 10, 100, 70, 60, "<< Prev" };
 Button btnPause = { 90, 100, 60, 60, "Pause" };
 Button btnPlay  = { 160, 100, 60, 60, "Play" };
@@ -44,7 +52,7 @@ bool isTouchInside(touchPosition touch, Button btn) {
             touch.py >= btn.y && touch.py <= btn.y + btn.height);
 }
 
-// libcurl memory callback (for saving data)
+// libcurl memory callback
 struct MemoryStruct {
     char *memory;
     size_t size;
@@ -65,35 +73,26 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
-// libcurl dummy callback (to prevent printing to the screen)
 static size_t WriteDummyCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     return size * nmemb; 
 }
 
-// Helper to find a boolean value in JSON, ignoring formatting
+// JSON utilities
 bool extractJsonBool(const char* json, const char* key) {
     char* keyPtr = strstr(json, key);
     if (!keyPtr) return false;
-
     char* start = keyPtr + strlen(key);
-    
     while(*start == ' ' || *start == ':' || *start == '\n' || *start == '\r') start++;
-
     if (strncmp(start, "true", 4) == 0) return true;
     return false;
 }
 
-// smarter JSON extractor that skips spaces and colons
 void extractJsonString(const char* json, const char* key, char* output, size_t maxLen) {
     char* keyPtr = strstr(json, key);
     if (!keyPtr) return;
-    
     char* start = keyPtr + strlen(key);
-    
-    // Advance past spaces, colons, and the opening quote
     while(*start == ' ' || *start == ':') start++;
     if (*start == '\"') start++; 
-    
     char* end = strchr(start, '\"');
     if (end) {
         size_t len = end - start;
@@ -103,11 +102,21 @@ void extractJsonString(const char* json, const char* key, char* output, size_t m
     }
 }
 
-// extract token from JSON string
+void unescapeUrl(char* url) {
+    char* src = url;
+    char* dst = url;
+    while (*src) {
+        if (*src == '\\' && *(src + 1) == '/') {
+            src++; 
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
 void extractAccessToken(const char* jsonResponse) {
     char tempToken[512] = "";
     extractJsonString(jsonResponse, "\"access_token\"", tempToken, sizeof(tempToken));
-    
     if (strlen(tempToken) > 0) {
         strncpy(currentAccessToken, tempToken, sizeof(currentAccessToken));
         sprintf(lastStatus, "Token Refreshed!");
@@ -116,11 +125,9 @@ void extractAccessToken(const char* jsonResponse) {
     }
 }
 
-// fetch a new 1-hour auth token on boot
 void refreshSpotifyToken() {
     CURL *curl;
     CURLcode res;
-    
     struct MemoryStruct chunk;
     chunk.memory = (char*)malloc(1);  
     chunk.size = 0;
@@ -128,7 +135,6 @@ void refreshSpotifyToken() {
     curl = curl_easy_init();
     if(curl) {
         sprintf(lastStatus, "Requesting token...");
-        
         curl_easy_setopt(curl, CURLOPT_URL, "https://accounts.spotify.com/api/token");
         
         char postData[1024];
@@ -139,10 +145,9 @@ void refreshSpotifyToken() {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-        
-        // disable SSL checks for 3DS
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 
         res = curl_easy_perform(curl);
         if(res == CURLE_OK) {
@@ -156,7 +161,47 @@ void refreshSpotifyToken() {
     }
 }
 
-// fetches the current playback status
+void fetchCoverArt(const char* url) {
+    sprintf(lastStatus, "Fetching Art...");
+    
+    CURL *curl = curl_easy_init();
+    if(!curl) return;
+
+    struct MemoryStruct chunk;
+    chunk.memory = (char*)malloc(1);
+    chunk.size = 0;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if(res == CURLE_OK && chunk.size > 0) {
+        if (coverPixels) {
+            stbi_image_free(coverPixels);
+            coverPixels = NULL;
+        }
+
+        int channels;
+        coverPixels = stbi_load_from_memory((const stbi_uc*)chunk.memory, chunk.size, &coverWidth, &coverHeight, &channels, 3);
+        
+        if (coverPixels) {
+            sprintf(lastStatus, "Art updated successfully");
+        } else {
+            sprintf(lastStatus, "Art decode failed");
+        }
+    } else {
+        sprintf(lastStatus, "Art DL error: %d", res);
+    }
+
+    curl_easy_cleanup(curl);
+    free(chunk.memory);
+}
+
 void fetchCurrentlyPlaying() {
     if (strlen(currentAccessToken) == 0) return;
 
@@ -178,10 +223,9 @@ void fetchCurrentlyPlaying() {
 
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-        
-        // Disable SSL checks for 3DS
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 
         res = curl_easy_perform(curl);
         if(res == CURLE_OK) {
@@ -189,27 +233,72 @@ void fetchCurrentlyPlaying() {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             
             if (response_code == 200 && chunk.size > 0) {
-                // Robust boolean check
                 isPlaying = extractJsonBool(chunk.memory, "\"is_playing\"");
 
-                // Grab the artist
                 char* artistsBlock = strstr(chunk.memory, "\"artists\"");
                 if (artistsBlock) {
                     extractJsonString(artistsBlock, "\"name\"", currentArtist, sizeof(currentArtist));
                 }
 
-                // Grab the track (anchor to duration_ms to skip Album names)
                 char* trackAnchor = strstr(chunk.memory, "\"duration_ms\"");
                 if (trackAnchor) {
+                    char newSongId[128] = "";
+                    extractJsonString(trackAnchor, "\"id\"", newSongId, sizeof(newSongId));
                     extractJsonString(trackAnchor, "\"name\"", currentSong, sizeof(currentSong));
+
+                    if (strlen(newSongId) > 0 && strcmp(newSongId, currentSongId) != 0) {
+                        strcpy(currentSongId, newSongId);
+
+                        char* albumBlock = strstr(chunk.memory, "\"album\"");
+                        char* imagesBlock = albumBlock ? strstr(albumBlock, "\"images\"") : NULL;
+                        
+                        char newCoverUrl[512] = "";
+                        if (imagesBlock) {
+                            char* current = imagesBlock;
+                            char* targetUrl = NULL;
+                            int urlCount = 0;
+                            char* endArray = strchr(imagesBlock, ']');
+                            
+                            // iterate to find the 2nd URL for 300x300 image
+                            while ((current = strstr(current, "\"url\"")) != NULL && (!endArray || current < endArray)) {
+                                urlCount++;
+                                if (urlCount == 2) { 
+                                    targetUrl = current;
+                                    break;
+                                }
+                                current += 5; 
+                            }
+                            
+                            // fallback to other image
+                            if (!targetUrl && urlCount == 1) {
+                                targetUrl = strstr(imagesBlock, "\"url\"");
+                            }
+                            
+                            if (targetUrl) {
+                                extractJsonString(targetUrl, "\"url\"", newCoverUrl, sizeof(newCoverUrl));
+                                unescapeUrl(newCoverUrl); 
+                            }
+                        }
+
+                        if (strlen(newCoverUrl) > 0) {
+                            strncpy(debugUrl, newCoverUrl, 50); 
+                            strcat(debugUrl, "...");
+                            fetchCoverArt(newCoverUrl);
+                        } else {
+                            strcpy(debugUrl, "None found");
+                            sprintf(lastStatus, "No Art URL found");
+                        }
+                    }
                 }
                 
             } else if (response_code == 204) {
-                // 204 No Content
                 strcpy(currentSong, "Nothing playing");
                 strcpy(currentArtist, "");
+                strcpy(currentSongId, "");
                 isPlaying = false;
             }
+        } else {
+             sprintf(lastStatus, "Net Err: %d", res);
         }
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -217,7 +306,6 @@ void fetchCurrentlyPlaying() {
     }
 }
 
-// send playback commands
 void sendSpotifyCommand(const char* endpoint, const char* method) {
     if (strlen(currentAccessToken) == 0) {
         sprintf(lastStatus, "No Token! Restart app.");
@@ -242,10 +330,9 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
 
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteDummyCallback);
-        
-        // disable SSL checks for 3DS
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 
         res = curl_easy_perform(curl);
         
@@ -254,8 +341,6 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             if(response_code == 204 || response_code == 200) {
                 sprintf(lastStatus, "Success: %s", endpoint);
-                
-                // Force a UI update 500ms from now
                 lastFetchTime = osGetTime() - FETCH_INTERVAL + 500; 
             } else {
                 sprintf(lastStatus, "API Error: %ld", response_code);
@@ -269,7 +354,55 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
     }
 }
 
-// main
+// dynamically scale image down
+void drawImageScaled(int startX, int startY, int targetW, int targetH, u8* imgData, int srcW, int srcH) {
+    if (!imgData) return;
+    
+    u16 fbWidth, fbHeight;
+    u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fbWidth, &fbHeight);
+    if (!fb) return;
+    
+    // auto-detect if the console is using 16-bit or 24-bit color
+    GSPGPU_FramebufferFormat format = gfxGetScreenFormat(GFX_TOP);
+    int bytesPerPixel = (format == GSP_RGB565_OES) ? 2 : 3;
+    
+    for (int y = 0; y < targetH; y++) {
+        for (int x = 0; x < targetW; x++) {
+            int screenX = startX + x;
+            int screenY = startY + y;
+            
+            // bounds check for the top screen (400x240)
+            if (screenX < 0 || screenX >= 400 || screenY < 0 || screenY >= 240) continue;
+            
+            // nearest-neighbor sampling to scale image
+            int srcX = (x * srcW) / targetW;
+            int srcY = (y * srcH) / targetH;
+            
+            u32 imgIndex = (srcY * srcW + srcX) * 3;
+            u8 r = imgData[imgIndex + 0];
+            u8 g = imgData[imgIndex + 1];
+            u8 b = imgData[imgIndex + 2];
+            
+            // mapping for (X, Y) to linear memory array
+            u32 fbPixelIndex = (screenX * 240 + (239 - screenY));
+            
+            if (bytesPerPixel == 3) {
+                // 24-bit BGR
+                u32 fbIndex = fbPixelIndex * 3;
+                fb[fbIndex + 0] = b; 
+                fb[fbIndex + 1] = g; 
+                fb[fbIndex + 2] = r; 
+            } else if (bytesPerPixel == 2) {
+                // 16-bit RGB565
+                u32 fbIndex = fbPixelIndex * 2;
+                u16 color565 = ((b >> 3) & 0x1F) | (((g >> 2) & 0x3F) << 5) | (((r >> 3) & 0x1F) << 11);
+                fb[fbIndex + 0] = color565 & 0xFF;
+                fb[fbIndex + 1] = (color565 >> 8) & 0xFF;
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     gfxInitDefault();
     
@@ -284,6 +417,7 @@ int main(int argc, char **argv) {
     consoleInit(GFX_TOP, &topScreen);
     consoleInit(GFX_BOTTOM, &bottomScreen);
 
+    // initial clear screen
     consoleSelect(&topScreen);
     printf("\x1b[2J");
     consoleSelect(&bottomScreen);
@@ -339,7 +473,9 @@ int main(int argc, char **argv) {
         }
 
         consoleSelect(&topScreen);
-        printf("\x1b[2;15H=== 3DSpotify ===");
+        printf("\x1b[H"); 
+        
+        printf("\x1b[2;15H=== 3DSpotify ===                         \n");
         
         char displayToken[15] = "";
         if(strlen(currentAccessToken) > 0) {
@@ -349,17 +485,24 @@ int main(int argc, char **argv) {
             strcpy(displayToken, "None");
         }
         
-        printf("\x1b[5;2HToken:  %-40s", displayToken);
-        printf("\x1b[8;2HStatus: %-40s", isPlaying ? "[> Playing]" : "[|| Paused]");
-        printf("\x1b[10;2HSong:   %-40s", currentSong);
-        printf("\x1b[12;2HArtist: %-40s", currentArtist);
+        printf("\x1b[5;2HToken:  %-40s\n", displayToken);
+        printf("\x1b[8;2HStatus: %-40s\n", isPlaying ? "[> Playing]" : "[|| Paused]");
+        printf("\x1b[10;2HSong:   %-40s\n", currentSong);
+        printf("\x1b[12;2HArtist: %-40s\n", currentArtist);
         
         printf("\x1b[28;2HPress START to exit.");
 
+        // draw 300x300 image
+        if (coverPixels) {
+            drawImageScaled(190, 20, 200, 200, coverPixels, coverWidth, coverHeight);
+        }
+
         consoleSelect(&bottomScreen);
-        printf("\x1b[2;10H--- Controls ---");
+        printf("\x1b[H"); 
+        printf("\x1b[2;10H--- Controls ---\n");
+        printf("\x1b[5;2HStatus: %-30s\n", lastStatus);
         
-        printf("\x1b[5;2HStatus: %-30s", lastStatus);
+        printf("\x1b[7;2HArt URL: %-30s\n", debugUrl);
 
         printf("\x1b[13;2H[ Prev ]");
         printf("\x1b[13;12H[ Pause ]");
@@ -371,6 +514,9 @@ int main(int argc, char **argv) {
         gspWaitForVBlank();
     }
 
+    if (coverPixels) {
+        stbi_image_free(coverPixels);
+    }
     curl_global_cleanup();
     socExit();
     free(socBuffer);
