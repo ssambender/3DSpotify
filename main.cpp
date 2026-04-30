@@ -47,16 +47,40 @@ const u64 FETCH_INTERVAL = 5000;
 // citro2d text buffer
 C2D_TextBuf g_dynamicBuf;
 
+// tab/window state
+enum BottomTab { TAB_PLAYBACK, TAB_LIBRARY, TAB_SETTINGS };
+BottomTab currentTab = TAB_PLAYBACK;
+
+struct PlaylistItem {
+    char name[64];
+    char uri[128];
+};
+
+#define MAX_PLAYLISTS 50
+PlaylistItem userPlaylists[MAX_PLAYLISTS];
+int numPlaylists = 0;
+bool libraryFetched = false;
+
+// tracl scrolling position
+int listScrollOffset = 0; 
+const int VISIBLE_ITEMS = 6;
+
 // ui
 struct Button {
     u16 x, y, width, height;
     const char* label;
 };
 
-Button btnPrev  = { 10,  120, 65, 80, "Prev" };
-Button btnPause = { 85,  120, 65, 80, "Pause" };
-Button btnPlay  = { 160, 120, 65, 80, "Play" };
-Button btnNext  = { 235, 120, 65, 80, "Next" };
+// playback buttons
+Button btnPrev  = { 10,  100, 65, 80, "Prev" };
+Button btnPause = { 85,  100, 65, 80, "Pause" };
+Button btnPlay  = { 160, 100, 65, 80, "Play" };
+Button btnNext  = { 235, 100, 65, 80, "Next" };
+
+// tab buttons
+Button btnTabPlayback = { 0,   210, 128, 30, "Controls" };
+Button btnTabLibrary  = { 128, 210, 128, 30, "Library" };
+Button btnTabSettings = { 256, 210, 64,  30, "Settings" };
 
 bool isTouchInside(touchPosition touch, Button btn) {
     return (touch.px >= btn.x && touch.px <= btn.x + btn.width &&
@@ -180,7 +204,79 @@ void refreshSpotifyToken() {
     }
 }
 
-// 3DS hardware texture swizzling for PICA200 gpu
+void fetchPlaylists() {
+    if (strlen(currentAccessToken) == 0) {
+        sprintf(lastStatus, "No Token!");
+        libraryFetched = true;
+        return;
+    }
+
+    sprintf(lastStatus, "Fetching Library...");
+    
+    CURL *curl = curl_easy_init();
+    struct MemoryStruct chunk;
+    chunk.memory = (char*)malloc(1);  
+    chunk.size = 0;
+
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.spotify.com/v1/me/playlists"); 
+
+        struct curl_slist *headers = NULL;
+        char authHeader[1024];
+        snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", currentAccessToken);
+        headers = curl_slist_append(headers, authHeader);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L); 
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+        CURLcode res = curl_easy_perform(curl);
+        if(res == CURLE_OK && chunk.size > 0) {
+            long response_code;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+            
+            if (response_code == 200) {
+                numPlaylists = 0;
+                listScrollOffset = 0; // reset scroll position on fetch new
+                char* itemPtr = strstr(chunk.memory, "\"items\"");
+                
+                while (itemPtr != NULL && numPlaylists < MAX_PLAYLISTS) {
+                    char* namePtr = strstr(itemPtr, "\"name\"");
+                    if (!namePtr) break;
+                    
+                    char* uriPtr = strstr(namePtr, "spotify:playlist:");
+                    if (!uriPtr) break;
+
+                    extractJsonString(namePtr, "\"name\"", userPlaylists[numPlaylists].name, sizeof(userPlaylists[0].name));
+                    
+                    char* quoteEnd = strchr(uriPtr, '\"');
+                    if (quoteEnd) {
+                        int len = quoteEnd - uriPtr;
+                        if (len > 127) len = 127;
+                        strncpy(userPlaylists[numPlaylists].uri, uriPtr, len);
+                        userPlaylists[numPlaylists].uri[len] = '\0';
+                    }
+
+                    numPlaylists++;
+                    itemPtr = uriPtr + 17; 
+                }
+                sprintf(lastStatus, "Library loaded: %d", numPlaylists);
+            } else {
+                sprintf(lastStatus, "Lib API Err: %ld", response_code);
+            }
+        } else {
+            sprintf(lastStatus, "Lib Net Err: %d", res);
+        }
+        
+        libraryFetched = true; 
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+    free(chunk.memory);
+}
+
 u32 morton_index(u32 x, u32 y, u32 width) {
     u32 i = (x & 7) | ((y & 7) << 8); 
     i = (i ^ (i << 2)) & 0x1313;
@@ -244,11 +340,10 @@ void fetchCoverArt(const char* url) {
                     vramTexData[morton_index(x, y, 256)] = color;
                 }
             }
-            
+
             // define visual wrapper
             albumSubTex.width = TARGET_IMG_SIZE;
             albumSubTex.height = TARGET_IMG_SIZE;
-            
             albumSubTex.left = 0.0f;
             albumSubTex.top = 1.0f; 
             albumSubTex.right = TARGET_IMG_SIZE / 256.0f;
@@ -426,6 +521,52 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
     }
 }
 
+void playContext(const char* contextUri) {
+    if (strlen(currentAccessToken) == 0) return;
+
+    sprintf(lastStatus, "Starting playlist...");
+    
+    CURL *curl = curl_easy_init();
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.spotify.com/v1/me/player/play");
+
+        struct curl_slist *headers = NULL;
+        char authHeader[1024];
+        snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", currentAccessToken);
+        headers = curl_slist_append(headers, authHeader);
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        char bodyData[256];
+        snprintf(bodyData, sizeof(bodyData), "{\"context_uri\":\"%s\"}", contextUri);
+
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, bodyData);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteDummyCallback);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+        CURLcode res = curl_easy_perform(curl);
+        
+        if(res == CURLE_OK) {
+            long response_code;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+            if(response_code == 204 || response_code == 200) {
+                sprintf(lastStatus, "Playlist Started!");
+                isPlaying = true;
+                lastFetchTime = osGetTime() - FETCH_INTERVAL + 500; 
+            } else {
+                sprintf(lastStatus, "Play Error: %ld", response_code);
+            }
+        } else {
+            sprintf(lastStatus, "Net Error: %s", curl_easy_strerror(res));
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+}
+
 // draw dynamic text w/ citro2d
 void DrawText(float x, float y, float size, u32 color, const char* format, ...) {
     char buffer[256];
@@ -470,10 +611,11 @@ int main(int argc, char **argv) {
     g_dynamicBuf = C2D_TextBufNew(4096);
 
     // HEX to citro2d colors
-    u32 clrBg       = C2D_Color32(18, 18, 18, 255);    // #121212
-    u32 clrGreen    = C2D_Color32(29, 185, 84, 255);   // #1db954
-    u32 clrBtnBg    = C2D_Color32(33, 33, 33, 255);    // #212121
-    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);    // #555555
+    u32 clrBg       = C2D_Color32(18, 18, 18, 255);    
+    u32 clrGreen    = C2D_Color32(29, 185, 84, 255);   
+    u32 clrBtnBg    = C2D_Color32(33, 33, 33, 255);    
+    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);    
+    u32 clrHighlight = C2D_Color32(50, 50, 50, 255);   
 
     refreshSpotifyToken();
     fetchCurrentlyPlaying();
@@ -488,6 +630,65 @@ int main(int argc, char **argv) {
 
         if (kDown & KEY_START) break;
 
+        // tab switching
+        if (kDown & KEY_R) { // RIGHT
+            if (currentTab == TAB_PLAYBACK) currentTab = TAB_LIBRARY;
+            else if (currentTab == TAB_LIBRARY) currentTab = TAB_SETTINGS;
+            else if (currentTab == TAB_SETTINGS) currentTab = TAB_PLAYBACK;
+        }
+        if (kDown & KEY_L) { // LEFT
+            if (currentTab == TAB_PLAYBACK) currentTab = TAB_SETTINGS;
+            else if (currentTab == TAB_LIBRARY) currentTab = TAB_PLAYBACK;
+            else if (currentTab == TAB_SETTINGS) currentTab = TAB_LIBRARY;
+        }
+
+        // fetch playlist on library tab
+        if ((kDown & KEY_L) || (kDown & KEY_R)) {
+            if (currentTab == TAB_LIBRARY && (!libraryFetched || numPlaylists == 0)) {
+                fetchPlaylists(); 
+            }
+        }
+
+        // scroll list
+        if (currentTab == TAB_LIBRARY && numPlaylists > VISIBLE_ITEMS) {
+            int maxOffset = numPlaylists - VISIBLE_ITEMS;
+            
+            // D-PAD DOWN
+            if ((kDown & KEY_DDOWN) || (kDown & KEY_CPAD_DOWN)) {
+                if (listScrollOffset < maxOffset) {
+                    listScrollOffset++;
+                } else {
+                    listScrollOffset = 0; // loop back to top
+                }
+            }
+            // D-PAD UP
+            if ((kDown & KEY_DUP) || (kDown & KEY_CPAD_UP)) {
+                if (listScrollOffset > 0) {
+                    listScrollOffset--;
+                } else {
+                    listScrollOffset = maxOffset; // loop to bottom
+                }
+            }
+            // D-PAD RIGHT
+            if ((kDown & KEY_DRIGHT) || (kDown & KEY_CPAD_RIGHT)) {
+                if (listScrollOffset == maxOffset) {
+                    listScrollOffset = 0; // loop back to top
+                } else {
+                    listScrollOffset += VISIBLE_ITEMS;
+                    if (listScrollOffset > maxOffset) listScrollOffset = maxOffset;
+                }
+            }
+            // D-PAD LEFT
+            if ((kDown & KEY_DLEFT) || (kDown & KEY_CPAD_LEFT)) {
+                if (listScrollOffset == 0) {
+                    listScrollOffset = maxOffset; // loop to bottom
+                } else {
+                    listScrollOffset -= VISIBLE_ITEMS;
+                    if (listScrollOffset < 0) listScrollOffset = 0;
+                }
+            }
+        }
+
         u64 currentTime = osGetTime();
         if (currentTime - lastFetchTime >= FETCH_INTERVAL) {
             fetchCurrentlyPlaying();
@@ -499,34 +700,69 @@ int main(int argc, char **argv) {
                 touchPosition touch;
                 hidTouchRead(&touch);
 
-                if (isTouchInside(touch, btnPrev)) {
-                    sprintf(lastStatus, "Sending: Previous...");
-                    currentProgressMs = 0; 
-                    lastSyncTime = osGetTime();
-                    sendSpotifyCommand("/previous", "POST");
-                    touchLock = true;
-                } 
-                else if (isTouchInside(touch, btnPause) && isPlaying) {
-                    sprintf(lastStatus, "Sending: Pause...");
-                    isPlaying = false;
-                    currentProgressMs += (osGetTime() - lastSyncTime); 
-                    lastSyncTime = osGetTime();
-                    sendSpotifyCommand("/pause", "PUT");
-                    touchLock = true;
-                } 
-                else if (isTouchInside(touch, btnPlay) && !isPlaying) {
-                    sprintf(lastStatus, "Sending: Play...");
-                    isPlaying = true;
-                    lastSyncTime = osGetTime(); 
-                    sendSpotifyCommand("/play", "PUT");
+                // tab switching
+                if (isTouchInside(touch, btnTabPlayback)) {
+                    currentTab = TAB_PLAYBACK;
                     touchLock = true;
                 }
-                else if (isTouchInside(touch, btnNext)) {
-                    sprintf(lastStatus, "Sending: Next...");
-                    currentProgressMs = 0; 
-                    lastSyncTime = osGetTime();
-                    sendSpotifyCommand("/next", "POST");
+                else if (isTouchInside(touch, btnTabLibrary)) {
+                    currentTab = TAB_LIBRARY;
+                    if (!libraryFetched || numPlaylists == 0) {
+                        fetchPlaylists(); 
+                    }
                     touchLock = true;
+                }
+                else if (isTouchInside(touch, btnTabSettings)) {
+                    currentTab = TAB_SETTINGS;
+                    touchLock = true;
+                }
+
+                // playback controls tab
+                if (currentTab == TAB_PLAYBACK && touchLock == false) {
+                    if (isTouchInside(touch, btnPrev)) {
+                        sprintf(lastStatus, "Sending: Previous...");
+                        currentProgressMs = 0; 
+                        lastSyncTime = osGetTime();
+                        sendSpotifyCommand("/previous", "POST");
+                        touchLock = true;
+                    } 
+                    else if (isTouchInside(touch, btnPause) && isPlaying) {
+                        sprintf(lastStatus, "Sending: Pause...");
+                        isPlaying = false;
+                        currentProgressMs += (osGetTime() - lastSyncTime); 
+                        lastSyncTime = osGetTime();
+                        sendSpotifyCommand("/pause", "PUT");
+                        touchLock = true;
+                    } 
+                    else if (isTouchInside(touch, btnPlay) && !isPlaying) {
+                        sprintf(lastStatus, "Sending: Play...");
+                        isPlaying = true;
+                        lastSyncTime = osGetTime(); 
+                        sendSpotifyCommand("/play", "PUT");
+                        touchLock = true;
+                    }
+                    else if (isTouchInside(touch, btnNext)) {
+                        sprintf(lastStatus, "Sending: Next...");
+                        currentProgressMs = 0; 
+                        lastSyncTime = osGetTime();
+                        sendSpotifyCommand("/next", "POST");
+                        touchLock = true;
+                    }
+                }
+                
+                // library/playlist tab
+                if (currentTab == TAB_LIBRARY && touchLock == false) {
+                    int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
+                    for (int i = 0; i < displayCount; i++) {
+                        Button row = {10, (u16)(45 + (i * 26)), 300, 22, ""};
+                        if (isTouchInside(touch, row)) {
+                            int actualDataIndex = listScrollOffset + i;
+                            playContext(userPlaylists[actualDataIndex].uri);
+                            touchLock = true;
+                            currentTab = TAB_PLAYBACK; 
+                            break;
+                        }
+                    }
                 }
             }
         } else {
@@ -535,7 +771,7 @@ int main(int argc, char **argv) {
 
         // rendering
         C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        C2D_TextBufClear(g_dynamicBuf); // reset text engine every frame
+        C2D_TextBufClear(g_dynamicBuf); 
 
         // ============= TOP SCREEN =================
         C2D_TargetClear(topTarget, clrBg);
@@ -562,19 +798,15 @@ int main(int argc, char **argv) {
             sprintf(progressDisplay, "%d:%02d / %d:%02d", p_min, p_sec, d_min, d_sec);
         }
         
-        // render native text
-        DrawText(10, 10,  0.6f, clrGreen, "=== 3DSpotify ===");
+        DrawText(10, 10,  1f, clrGreen, "3DSpotify");
         DrawText(10, 35,  0.5f, clrGreen, "Token: %.18s", displayToken);
         DrawText(10, 60,  0.5f, clrGreen, "Status: %s", isPlaying ? "> Playing" : "|| Paused");
         DrawText(10, 85,  0.5f, clrGreen, "Time: %s", progressDisplay);
         
-        // truncate song title and artist
         DrawText(10, 110, 0.5f, clrGreen, "Song: %.22s", currentSong);
         DrawText(10, 135, 0.5f, clrGreen, "Artist: %.22s", currentArtist);
-        
         DrawText(10, 210, 0.5f, clrDisabled, "Press START to exit.");
 
-        // pre-swizzled text to GPU
         if (texLoaded) {
             C2D_DrawImageAt(albumImg, 190.0f, 20.0f, 0.5f, NULL, 1.0f, 1.0f);
         }
@@ -583,31 +815,76 @@ int main(int argc, char **argv) {
         C2D_TargetClear(bottomTarget, clrBg);
         C2D_SceneBegin(bottomTarget);
         
-        DrawText(10, 10, 0.6f, clrGreen, "--- Controls ---");
-        DrawText(10, 40, 0.5f, clrGreen, "Status: %.35s", lastStatus);
-        DrawText(10, 60, 0.5f, clrGreen, "Art URL: %.35s", debugUrl);
+        if (currentTab == TAB_PLAYBACK) {
+            DrawText(10, 10, 0.6f, clrGreen, "Controls");
+            DrawText(10, 40, 0.5f, clrGreen, "Status: %.35s", lastStatus);
+            DrawText(10, 60, 0.5f, clrGreen, "Art URL: %.35s", debugUrl);
 
-        // render buttons
-        // PREV
-        C2D_DrawRectSolid(btnPrev.x, btnPrev.y, 0.5f, btnPrev.width, btnPrev.height, clrBtnBg);
-        DrawBorderC2D(btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, 2.0f, clrGreen);
-        DrawText(btnPrev.x + 12, btnPrev.y + 32, 0.55f, clrGreen, btnPrev.label);
+            C2D_DrawRectSolid(btnPrev.x, btnPrev.y, 0.5f, btnPrev.width, btnPrev.height, clrBtnBg);
+            DrawBorderC2D(btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, 2.0f, clrGreen);
+            DrawText(btnPrev.x + 12, btnPrev.y + 32, 0.55f, clrGreen, btnPrev.label);
 
-        // OAUSE
-        C2D_DrawRectSolid(btnPause.x, btnPause.y, 0.5f, btnPause.width, btnPause.height, clrBtnBg);
-        DrawBorderC2D(btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2.0f, isPlaying ? clrGreen : clrDisabled);
-        DrawText(btnPause.x + 10, btnPause.y + 32, 0.55f, isPlaying ? clrGreen : clrDisabled, btnPause.label);
+            C2D_DrawRectSolid(btnPause.x, btnPause.y, 0.5f, btnPause.width, btnPause.height, clrBtnBg);
+            DrawBorderC2D(btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2.0f, isPlaying ? clrGreen : clrDisabled);
+            DrawText(btnPause.x + 10, btnPause.y + 32, 0.55f, isPlaying ? clrGreen : clrDisabled, btnPause.label);
 
-        // PLAY
-        C2D_DrawRectSolid(btnPlay.x, btnPlay.y, 0.5f, btnPlay.width, btnPlay.height, clrBtnBg);
-        DrawBorderC2D(btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2.0f, !isPlaying ? clrGreen : clrDisabled);
-        DrawText(btnPlay.x + 15, btnPlay.y + 32, 0.55f, !isPlaying ? clrGreen : clrDisabled, btnPlay.label);
+            C2D_DrawRectSolid(btnPlay.x, btnPlay.y, 0.5f, btnPlay.width, btnPlay.height, clrBtnBg);
+            DrawBorderC2D(btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2.0f, !isPlaying ? clrGreen : clrDisabled);
+            DrawText(btnPlay.x + 15, btnPlay.y + 32, 0.55f, !isPlaying ? clrGreen : clrDisabled, btnPlay.label);
 
-        // NEXT
-        C2D_DrawRectSolid(btnNext.x, btnNext.y, 0.5f, btnNext.width, btnNext.height, clrBtnBg);
-        DrawBorderC2D(btnNext.x, btnNext.y, btnNext.width, btnNext.height, 2.0f, clrGreen);
-        DrawText(btnNext.x + 15, btnNext.y + 32, 0.55f, clrGreen, btnNext.label);
+            C2D_DrawRectSolid(btnNext.x, btnNext.y, 0.5f, btnNext.width, btnNext.height, clrBtnBg);
+            DrawBorderC2D(btnNext.x, btnNext.y, btnNext.width, btnNext.height, 2.0f, clrGreen);
+            DrawText(btnNext.x + 15, btnNext.y + 32, 0.55f, clrGreen, btnNext.label);
+            
+        } else if (currentTab == TAB_LIBRARY) {
+            DrawText(10, 10, 0.6f, clrGreen, "Your Playlists");
+            
+            if (!libraryFetched) {
+                DrawText(10, 50, 0.5f, clrDisabled, "Loading...");
+            } else if (numPlaylists == 0) {
+                DrawText(10, 50, 0.5f, clrDisabled, "No playlists found. Tap tab to retry.");
+            } else {
+                // calculate which playlists on screen
+                int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
 
+                if (numPlaylists > VISIBLE_ITEMS) {
+                    DrawText(150, 10, 0.4f, clrDisabled, "(Up/Down: Scroll)"); 
+                    // range
+                    DrawText(220, 25, 0.45f, clrGreen, "%d-%d / %d", listScrollOffset + 1, listScrollOffset + displayCount, numPlaylists);
+                }
+
+                for (int i = 0; i < displayCount; i++) {
+                    int actualDataIndex = listScrollOffset + i;
+                    int yPos = 45 + (i * 26); 
+                    C2D_DrawRectSolid(10, yPos, 0.5f, 300, 22, clrBtnBg);
+                    DrawText(15, yPos + 3, 0.45f, clrGreen, "> %.40s", userPlaylists[actualDataIndex].name);
+                }
+            }
+        } else if (currentTab == TAB_SETTINGS) {
+            // settings tab
+            DrawText(10, 10, 0.6f, clrGreen, "Settings");
+            DrawText(10, 50, 0.5f, clrDisabled, "Settings coming soon...");
+            
+            // placeholder button
+            Button btnDummy = { 10, 80, 200, 30, "Clear Cache (WIP)" };
+            C2D_DrawRectSolid(btnDummy.x, btnDummy.y, 0.5f, btnDummy.width, btnDummy.height, clrBtnBg);
+            DrawBorderC2D(btnDummy.x, btnDummy.y, btnDummy.width, btnDummy.height, 2.0f, clrDisabled);
+            DrawText(btnDummy.x + 10, btnDummy.y + 7, 0.5f, clrDisabled, btnDummy.label);
+        }
+
+        // render tabs
+        C2D_DrawRectSolid(btnTabPlayback.x, btnTabPlayback.y, 0.5f, btnTabPlayback.width, btnTabPlayback.height, currentTab == TAB_PLAYBACK ? clrHighlight : clrBtnBg);
+        DrawBorderC2D(btnTabPlayback.x, btnTabPlayback.y, btnTabPlayback.width, btnTabPlayback.height, 1.0f, clrDisabled);
+        DrawText(btnTabPlayback.x + 35, btnTabPlayback.y + 8, 0.5f, currentTab == TAB_PLAYBACK ? clrGreen : clrDisabled, btnTabPlayback.label);
+        
+        C2D_DrawRectSolid(btnTabLibrary.x, btnTabLibrary.y, 0.5f, btnTabLibrary.width, btnTabLibrary.height, currentTab == TAB_LIBRARY ? clrHighlight : clrBtnBg);
+        DrawBorderC2D(btnTabLibrary.x, btnTabLibrary.y, btnTabLibrary.width, btnTabLibrary.height, 1.0f, clrDisabled);
+        DrawText(btnTabLibrary.x + 40, btnTabLibrary.y + 8, 0.5f, currentTab == TAB_LIBRARY ? clrGreen : clrDisabled, btnTabLibrary.label);
+
+        C2D_DrawRectSolid(btnTabSettings.x, btnTabSettings.y, 0.5f, btnTabSettings.width, btnTabSettings.height, currentTab == TAB_SETTINGS ? clrHighlight : clrBtnBg);
+        DrawBorderC2D(btnTabSettings.x, btnTabSettings.y, btnTabSettings.width, btnTabSettings.height, 1.0f, clrDisabled);
+        DrawText(btnTabSettings.x + 10, btnTabSettings.y + 10, 0.45f, currentTab == TAB_SETTINGS ? clrGreen : clrDisabled, btnTabSettings.label);
+        
         C3D_FrameEnd(0);
     }
 
@@ -615,7 +892,6 @@ int main(int argc, char **argv) {
         C3D_TexDelete(&albumTex); 
     }
     
-    // clean up graphics engines
     C2D_TextBufDelete(g_dynamicBuf);
     C2D_Fini();
     C3D_Fini();
