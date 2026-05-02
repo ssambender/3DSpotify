@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <stdarg.h>
+// #include <romfs.h>
 #include <curl/curl.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -37,6 +38,32 @@ C2D_Image albumImg;
 Tex3DS_SubTexture albumSubTex;
 const int TARGET_IMG_SIZE = 200; 
 
+// Tab image data
+C3D_Tex tabTexPlayback, tabTexLibrary, tabTexSettings;
+C2D_Image imgTabPlayback, imgTabLibrary, imgTabSettings;
+bool tabImagesLoaded = false;
+Tex3DS_SubTexture tabSubTex = { 108, 60, 10.0f / 128.0f, 1.0f - 4.0f / 64.0f, 118.0f / 128.0f, 0.0f };
+
+// control button
+C3D_Tex texControlPlay, texControlPause, texControlNext, texControlPrev;
+C3D_Tex texControlPlay2, texControlPause2, texControlNext2, texControlPrev2;
+C2D_Image imgControlPlay, imgControlPause, imgControlNext, imgControlPrev;
+C2D_Image imgControlPlay2, imgControlPause2, imgControlNext2, imgControlPrev2;
+bool controlImagesLoaded = false;
+Tex3DS_SubTexture controlSubTex = { 110, 64, 9.0f / 128.0f, 1.0f, 119.0f / 128.0f, 0.0f };
+
+// button timers for texture changeback
+u64 prevClickedTime = 0;
+u64 nextClickedTime = 0;
+u64 playClickedTime = 0;
+u64 pauseClickedTime = 0;
+
+// cover art border
+C3D_Tex texBorder;
+C2D_Image imgBorder;
+bool borderLoaded = false;
+Tex3DS_SubTexture borderSubTex = { 171, 171, 0.0f, 1.0f, 171.0f / 256.0f, (256.0f - 171.0f) / 256.0f };
+
 // polling timer variables
 u64 lastFetchTime = 0;
 const u64 FETCH_INTERVAL = 5000;
@@ -46,6 +73,7 @@ const u64 FETCH_INTERVAL = 5000;
 
 // citro2d text buffer
 C2D_TextBuf g_dynamicBuf;
+C2D_Font fontFranxurter;
 
 // tab/window state
 enum BottomTab { TAB_PLAYBACK, TAB_LIBRARY, TAB_SETTINGS };
@@ -63,24 +91,24 @@ bool libraryFetched = false;
 
 // tracl scrolling position
 int listScrollOffset = 0; 
-const int VISIBLE_ITEMS = 6;
+const int VISIBLE_ITEMS = 5;
 
 // ui
 struct Button {
-    u16 x, y, width, height;
+    s16 x, y, width, height;
     const char* label;
 };
 
 // playback buttons
-Button btnPrev  = { 10,  100, 65, 80, "Prev" };
-Button btnPause = { 85,  100, 65, 80, "Pause" };
-Button btnPlay  = { 160, 100, 65, 80, "Play" };
-Button btnNext  = { 235, 100, 65, 80, "Next" };
+Button btnPlay  = { 40,  26,  110, 62, "Play" };
+Button btnPause = { 170, 26,  110, 62, "Pause" };
+Button btnPrev  = { 40,  106, 110, 62, "Prev" };
+Button btnNext  = { 170, 106, 110, 62, "Next" };
 
 // tab buttons
-Button btnTabPlayback = { 0,   210, 128, 30, "Controls" };
-Button btnTabLibrary  = { 128, 210, 128, 30, "Library" };
-Button btnTabSettings = { 256, 210, 64,  30, "Settings" };
+Button btnTabPlayback = { -1,   190, 106, 45, "Controls" };
+Button btnTabLibrary  = { 106, 190, 107, 45, "Library" };
+Button btnTabSettings = { 213, 190, 107, 45, "Settings" };
 
 bool isTouchInside(touchPosition touch, Button btn) {
     return (touch.px >= btn.x && touch.px <= btn.x + btn.width &&
@@ -581,12 +609,133 @@ void DrawText(float x, float y, float size, u32 color, const char* format, ...) 
     C2D_DrawText(&textObj, C2D_WithColor, x, y, 0.5f, size, size, color);
 }
 
+// draw centered dynamic text w/ citro2d
+void DrawTextCentered(C2D_Font font, float y, float size, u32 color, const char* format, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    C2D_Text textObj;
+    
+    // Check if a custom font was passed
+    if (font) {
+        C2D_TextFontParse(&textObj, font, g_dynamicBuf, buffer);
+    } else {
+        C2D_TextParse(&textObj, g_dynamicBuf, buffer);
+    }
+    
+    C2D_TextOptimize(&textObj);
+    
+    // get dimensions of the text
+    float textWidth, textHeight;
+    C2D_TextGetDimensions(&textObj, size, size, &textWidth, &textHeight);
+    
+    // calculate centered X (top center is 200)
+    float x = 200.0f - (textWidth / 2.0f);
+    
+    C2D_DrawText(&textObj, C2D_WithColor, x, y, 0.5f, size, size, color);
+}
+
 // draw borders w/ citro2d
 void DrawBorderC2D(float x, float y, float w, float h, float t, u32 color) {
-    C2D_DrawRectSolid(x, y, 0.5f, w, t, color); // top
-    C2D_DrawRectSolid(x, y + h - t, 0.5f, w, t, color); // bottom
-    C2D_DrawRectSolid(x, y, 0.5f, t, h, color); // left
-    C2D_DrawRectSolid(x + w - t, y, 0.5f, t, h, color); // right
+    C2D_DrawRectSolid(x, y, 0.5f, w, t, color);          // top
+    C2D_DrawRectSolid(x, y + h - t, 0.5f, w, t, color);  // bottom
+    C2D_DrawRectSolid(x, y, 0.5f, t, h, color);          // left
+    C2D_DrawRectSolid(x + w - t, y, 0.5f, t, h, color);  // right
+}
+
+void loadControlTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
+    int width, height, channels;
+    unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
+    if (!data) return;
+
+    // fixed canvas size packed for GPU
+    C3D_TexInit(tex, 128, 64, GPU_RGBA8); 
+    C3D_TexSetFilter(tex, GPU_LINEAR, GPU_NEAREST); 
+    
+    u32* vram = (u32*)tex->data;
+    memset(vram, 0, 128 * 64 * 4); 
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int srcIdx = (y * width + x) * 4;
+            u8 r = data[srcIdx + 0];
+            u8 g = data[srcIdx + 1];
+            u8 b = data[srcIdx + 2];
+            u8 a = data[srcIdx + 3];
+
+            u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+            vram[morton_index(x, y, 128)] = color;
+        }
+    }
+
+    img->tex = tex;
+    img->subtex = &controlSubTex; 
+    
+    stbi_image_free(data);
+}
+
+void loadTabTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
+    int width, height, channels;
+    // load from romfs
+    unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
+    if (!data) return;
+
+    C3D_TexInit(tex, 128, 64, GPU_RGBA8); 
+    C3D_TexSetFilter(tex, GPU_LINEAR, GPU_NEAREST);
+    
+    u32* vram = (u32*)tex->data;
+    memset(vram, 0, 128 * 64 * 4); 
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int srcIdx = (y * width + x) * 4;
+            u8 r = data[srcIdx + 0];
+            u8 g = data[srcIdx + 1];
+            u8 b = data[srcIdx + 2];
+            u8 a = data[srcIdx + 3];
+
+            u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+            vram[morton_index(x, y, 128)] = color;
+        }
+    }
+
+    img->tex = tex;
+    img->subtex = &tabSubTex; 
+    
+    stbi_image_free(data);
+}
+
+void loadBorderTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
+    int width, height, channels;
+    unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
+    if (!data) return;
+
+    C3D_TexInit(tex, 256, 256, GPU_RGBA8); 
+    C3D_TexSetFilter(tex, GPU_NEAREST, GPU_NEAREST); 
+    
+    u32* vram = (u32*)tex->data;
+    memset(vram, 0, 256 * 256 * 4);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int srcIdx = (y * width + x) * 4;
+            u8 r = data[srcIdx + 0];
+            u8 g = data[srcIdx + 1];
+            u8 b = data[srcIdx + 2];
+            u8 a = data[srcIdx + 3];
+
+            u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+            vram[morton_index(x, y, 256)] = color;
+        }
+    }
+
+    img->tex = tex;
+    img->subtex = &borderSubTex; 
+    
+    stbi_image_free(data);
 }
 
 int main(int argc, char **argv) {
@@ -611,17 +760,52 @@ int main(int argc, char **argv) {
     g_dynamicBuf = C2D_TextBufNew(4096);
 
     // HEX to citro2d colors
-    u32 clrBg       = C2D_Color32(18, 18, 18, 255);    
-    u32 clrGreen    = C2D_Color32(29, 185, 84, 255);   
-    u32 clrBtnBg    = C2D_Color32(33, 33, 33, 255);    
-    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);    
-    u32 clrHighlight = C2D_Color32(50, 50, 50, 255);   
+    // u32 clrBg       = C2D_Color32(18, 18, 18, 255);     // #121212
+    u32 clrGreen    = C2D_Color32(49, 49, 49, 255);    // rgb(49, 49, 49)
+    u32 clrBtnBg    = C2D_Color32(225, 221, 209, 255);     // rgb(225, 221, 209)
+    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);     // #555555
+    // u32 clrHighlight = C2D_Color32(50, 50, 50, 255);    // #323232
+
+    u32 clrBlack     = C2D_Color32(0, 0, 0, 255);
+    // u32 clrWhite = C2D_Color32(255, 255, 255, 255);
+
+    // BG colors for citro2d
+    u32 clrCheck1    = C2D_Color32(161, 225, 245, 255); // #A1E1F5
+    u32 clrCheck2    = C2D_Color32(186, 234, 249, 255); // #BAEAF9
+    u32 clrGradTop   = C2D_Color32(220, 248, 222, 255); // #DCF8DE
+    u32 clrGradBot   = C2D_Color32(180, 237, 195, 255); // #B4EDC3
 
     refreshSpotifyToken();
     fetchCurrentlyPlaying();
     lastFetchTime = osGetTime();
 
     bool touchLock = false;
+
+    romfsInit(); 
+
+    fontFranxurter = C2D_FontLoad("romfs:/franxurter.bcfnt");
+    
+    // load tab buttons
+    loadTabTexture(&tabTexPlayback, &imgTabPlayback, "romfs:/tab_playback.png");
+    loadTabTexture(&tabTexLibrary, &imgTabLibrary, "romfs:/tab_library.png");
+    loadTabTexture(&tabTexSettings, &imgTabSettings, "romfs:/tab_settings.png");
+    tabImagesLoaded = true;
+
+    // Load new control buttons
+    loadControlTexture(&texControlPlay, &imgControlPlay, "romfs:/control_play.png");
+    loadControlTexture(&texControlPause, &imgControlPause, "romfs:/control_pause.png");
+    loadControlTexture(&texControlNext, &imgControlNext, "romfs:/control_next.png");
+    loadControlTexture(&texControlPrev, &imgControlPrev, "romfs:/control_prev.png");
+
+    loadControlTexture(&texControlPlay2, &imgControlPlay2, "romfs:/control_play2.png");
+    loadControlTexture(&texControlPause2, &imgControlPause2, "romfs:/control_pause2.png");
+    loadControlTexture(&texControlNext2, &imgControlNext2, "romfs:/control_next2.png");
+    loadControlTexture(&texControlPrev2, &imgControlPrev2, "romfs:/control_prev2.png");
+    controlImagesLoaded = true;
+    
+    // load border frame
+    loadBorderTexture(&texBorder, &imgBorder, "romfs:/art_border.png");
+    borderLoaded = true;
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -723,6 +907,7 @@ int main(int argc, char **argv) {
                         sprintf(lastStatus, "Sending: Previous...");
                         currentProgressMs = 0; 
                         lastSyncTime = osGetTime();
+                        prevClickedTime = osGetTime();
                         sendSpotifyCommand("/previous", "POST");
                         touchLock = true;
                     } 
@@ -731,6 +916,7 @@ int main(int argc, char **argv) {
                         isPlaying = false;
                         currentProgressMs += (osGetTime() - lastSyncTime); 
                         lastSyncTime = osGetTime();
+                        pauseClickedTime = osGetTime();
                         sendSpotifyCommand("/pause", "PUT");
                         touchLock = true;
                     } 
@@ -738,6 +924,7 @@ int main(int argc, char **argv) {
                         sprintf(lastStatus, "Sending: Play...");
                         isPlaying = true;
                         lastSyncTime = osGetTime(); 
+                        playClickedTime = osGetTime();
                         sendSpotifyCommand("/play", "PUT");
                         touchLock = true;
                     }
@@ -745,6 +932,7 @@ int main(int argc, char **argv) {
                         sprintf(lastStatus, "Sending: Next...");
                         currentProgressMs = 0; 
                         lastSyncTime = osGetTime();
+                        nextClickedTime = osGetTime();
                         sendSpotifyCommand("/next", "POST");
                         touchLock = true;
                     }
@@ -754,7 +942,7 @@ int main(int argc, char **argv) {
                 if (currentTab == TAB_LIBRARY && touchLock == false) {
                     int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
                     for (int i = 0; i < displayCount; i++) {
-                        Button row = {10, (u16)(45 + (i * 26)), 300, 22, ""};
+                        Button row = {10, (s16)(45 + (i * 26)), 300, 22, ""};
                         if (isTouchInside(touch, row)) {
                             int actualDataIndex = listScrollOffset + i;
                             playContext(userPlaylists[actualDataIndex].uri);
@@ -774,14 +962,20 @@ int main(int argc, char **argv) {
         C2D_TextBufClear(g_dynamicBuf); 
 
         // ============= TOP SCREEN =================
-        C2D_TargetClear(topTarget, clrBg);
+        C2D_TargetClear(topTarget, clrCheck1);
         C2D_SceneBegin(topTarget);
         
-        char displayToken[15] = "";
-        if(strlen(currentAccessToken) > 0) {
-            snprintf(displayToken, sizeof(displayToken), "%.10s...", currentAccessToken);
-        } else {
-            strcpy(displayToken, "None");
+        // bg checkerboard
+        int tileSize = 20;
+        for (int y = 0; y < 240; y += tileSize) {
+            for (int x = 0; x < 400; x += tileSize) {
+                int row = y / tileSize;
+                int col = x / tileSize;
+                
+                if ((row + col) % 2 != 0) {
+                    C2D_DrawRectSolid(x, y, 0.5f, tileSize, tileSize, clrCheck2);
+                }
+            }
         }
 
         char progressDisplay[32] = "0:00 / 0:00";
@@ -798,43 +992,56 @@ int main(int argc, char **argv) {
             sprintf(progressDisplay, "%d:%02d / %d:%02d", p_min, p_sec, d_min, d_sec);
         }
         
-        DrawText(10, 10,  1f, clrGreen, "3DSpotify");
-        DrawText(10, 35,  0.5f, clrGreen, "Token: %.18s", displayToken);
-        DrawText(10, 60,  0.5f, clrGreen, "Status: %s", isPlaying ? "> Playing" : "|| Paused");
-        DrawText(10, 85,  0.5f, clrGreen, "Time: %s", progressDisplay);
+        DrawText(10, 10,  0.5f, clrBlack, "%s", progressDisplay);
         
-        DrawText(10, 110, 0.5f, clrGreen, "Song: %.22s", currentSong);
-        DrawText(10, 135, 0.5f, clrGreen, "Artist: %.22s", currentArtist);
-        DrawText(10, 210, 0.5f, clrDisabled, "Press START to exit.");
-
+        // centered album art 125 = 200 - (150/2) --- 150px by 150px
         if (texLoaded) {
-            C2D_DrawImageAt(albumImg, 190.0f, 20.0f, 0.5f, NULL, 1.0f, 1.0f);
+            C2D_DrawImageAt(albumImg, 125.0f, 24.0f, 0.5f, NULL, 0.75f, 0.75f);
+        }
+        if (borderLoaded) {
+            C2D_DrawImageAt(imgBorder, 114.0f, 16.0f, 0.5f, NULL, 1.0f, 1.0f);
         }
 
+        DrawTextCentered(fontFranxurter, 182, 1.2f, clrBlack, "%.22s", currentSong);
+        DrawTextCentered(NULL, 216, 0.6f, clrBlack, "%.22s", currentArtist);
+        DrawText(10, 220, 0.4f, clrDisabled, "Press START to exit.");
+
         // ============= BOTTOM SCREEN =================
-        C2D_TargetClear(bottomTarget, clrBg);
+        C2D_TargetClear(bottomTarget, clrGradBot);
         C2D_SceneBegin(bottomTarget);
+
+        // bg gradient
+        C2D_DrawRectangle(0, 0, 0.5f, 320, 240, clrGradTop, clrGradTop, clrGradBot, clrGradBot);
         
         if (currentTab == TAB_PLAYBACK) {
-            DrawText(10, 10, 0.6f, clrGreen, "Controls");
-            DrawText(10, 40, 0.5f, clrGreen, "Status: %.35s", lastStatus);
-            DrawText(10, 60, 0.5f, clrGreen, "Art URL: %.35s", debugUrl);
 
-            C2D_DrawRectSolid(btnPrev.x, btnPrev.y, 0.5f, btnPrev.width, btnPrev.height, clrBtnBg);
-            DrawBorderC2D(btnPrev.x, btnPrev.y, btnPrev.width, btnPrev.height, 2.0f, clrGreen);
-            DrawText(btnPrev.x + 12, btnPrev.y + 32, 0.55f, clrGreen, btnPrev.label);
+            // PLAY BTN
+            if (osGetTime() - playClickedTime < 800) {
+                C2D_DrawImageAt(imgControlPlay2, btnPlay.x, btnPlay.y, 0.5f, NULL, 1.0f, 1.0f);
+            } else {
+                C2D_DrawImageAt(imgControlPlay, btnPlay.x, btnPlay.y, 0.5f, NULL, 1.0f, 1.0f);
+            }
 
-            C2D_DrawRectSolid(btnPause.x, btnPause.y, 0.5f, btnPause.width, btnPause.height, clrBtnBg);
-            DrawBorderC2D(btnPause.x, btnPause.y, btnPause.width, btnPause.height, 2.0f, isPlaying ? clrGreen : clrDisabled);
-            DrawText(btnPause.x + 10, btnPause.y + 32, 0.55f, isPlaying ? clrGreen : clrDisabled, btnPause.label);
+            // PAUSE BTN
+            if (osGetTime() - pauseClickedTime < 800) {
+                C2D_DrawImageAt(imgControlPause2, btnPause.x, btnPause.y, 0.5f, NULL, 1.0f, 1.0f);
+            } else {
+                C2D_DrawImageAt(imgControlPause, btnPause.x, btnPause.y, 0.5f, NULL, 1.0f, 1.0f);
+            }
 
-            C2D_DrawRectSolid(btnPlay.x, btnPlay.y, 0.5f, btnPlay.width, btnPlay.height, clrBtnBg);
-            DrawBorderC2D(btnPlay.x, btnPlay.y, btnPlay.width, btnPlay.height, 2.0f, !isPlaying ? clrGreen : clrDisabled);
-            DrawText(btnPlay.x + 15, btnPlay.y + 32, 0.55f, !isPlaying ? clrGreen : clrDisabled, btnPlay.label);
+            // PREV BTN
+            if (osGetTime() - prevClickedTime < 800) {
+                C2D_DrawImageAt(imgControlPrev2, btnPrev.x, btnPrev.y, 0.5f, NULL, 1.0f, 1.0f);
+            } else {
+                C2D_DrawImageAt(imgControlPrev, btnPrev.x, btnPrev.y, 0.5f, NULL, 1.0f, 1.0f);
+            }
 
-            C2D_DrawRectSolid(btnNext.x, btnNext.y, 0.5f, btnNext.width, btnNext.height, clrBtnBg);
-            DrawBorderC2D(btnNext.x, btnNext.y, btnNext.width, btnNext.height, 2.0f, clrGreen);
-            DrawText(btnNext.x + 15, btnNext.y + 32, 0.55f, clrGreen, btnNext.label);
+            // NEXT BTN
+            if (osGetTime() - nextClickedTime < 800) {
+                C2D_DrawImageAt(imgControlNext2, btnNext.x, btnNext.y, 0.5f, NULL, 1.0f, 1.0f);
+            } else {
+                C2D_DrawImageAt(imgControlNext, btnNext.x, btnNext.y, 0.5f, NULL, 1.0f, 1.0f);
+            }
             
         } else if (currentTab == TAB_LIBRARY) {
             DrawText(10, 10, 0.6f, clrGreen, "Your Playlists");
@@ -844,46 +1051,53 @@ int main(int argc, char **argv) {
             } else if (numPlaylists == 0) {
                 DrawText(10, 50, 0.5f, clrDisabled, "No playlists found. Tap tab to retry.");
             } else {
-                // calculate which playlists on screen
                 int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
 
                 if (numPlaylists > VISIBLE_ITEMS) {
                     DrawText(150, 10, 0.4f, clrDisabled, "(Up/Down: Scroll)"); 
-                    // range
                     DrawText(220, 25, 0.45f, clrGreen, "%d-%d / %d", listScrollOffset + 1, listScrollOffset + displayCount, numPlaylists);
                 }
 
                 for (int i = 0; i < displayCount; i++) {
                     int actualDataIndex = listScrollOffset + i;
-                    int yPos = 45 + (i * 26); 
+                    int yPos = 45 + (i * 26);
                     C2D_DrawRectSolid(10, yPos, 0.5f, 300, 22, clrBtnBg);
                     DrawText(15, yPos + 3, 0.45f, clrGreen, "> %.40s", userPlaylists[actualDataIndex].name);
                 }
             }
         } else if (currentTab == TAB_SETTINGS) {
             // settings tab
-            DrawText(10, 10, 0.6f, clrGreen, "Settings");
-            DrawText(10, 50, 0.5f, clrDisabled, "Settings coming soon...");
+            DrawText(10, 10, 0.6f, clrGreen, "Settings & Debug");
+
+            char displayToken[25] = "";
+            if(strlen(currentAccessToken) > 0) {
+                snprintf(displayToken, sizeof(displayToken), "%.20s...", currentAccessToken);
+            } else {
+                strcpy(displayToken, "None");
+            }
             
-            // placeholder button
-            Button btnDummy = { 10, 80, 200, 30, "Clear Cache (WIP)" };
-            C2D_DrawRectSolid(btnDummy.x, btnDummy.y, 0.5f, btnDummy.width, btnDummy.height, clrBtnBg);
-            DrawBorderC2D(btnDummy.x, btnDummy.y, btnDummy.width, btnDummy.height, 2.0f, clrDisabled);
-            DrawText(btnDummy.x + 10, btnDummy.y + 7, 0.5f, clrDisabled, btnDummy.label);
+            DrawText(10, 40, 0.45f, clrGreen, "Token: %.18s", displayToken);
+            DrawText(10, 60, 0.45f, clrGreen, "Play State: %s", isPlaying ? "Playing" : "Paused");
+            DrawText(10, 80, 0.45f, clrGreen, "API Status: %.35s", lastStatus);
+            DrawText(10, 100, 0.45f, clrGreen, "Art URL: %.35s", debugUrl);
         }
 
         // render tabs
-        C2D_DrawRectSolid(btnTabPlayback.x, btnTabPlayback.y, 0.5f, btnTabPlayback.width, btnTabPlayback.height, currentTab == TAB_PLAYBACK ? clrHighlight : clrBtnBg);
-        DrawBorderC2D(btnTabPlayback.x, btnTabPlayback.y, btnTabPlayback.width, btnTabPlayback.height, 1.0f, clrDisabled);
-        DrawText(btnTabPlayback.x + 35, btnTabPlayback.y + 8, 0.5f, currentTab == TAB_PLAYBACK ? clrGreen : clrDisabled, btnTabPlayback.label);
-        
-        C2D_DrawRectSolid(btnTabLibrary.x, btnTabLibrary.y, 0.5f, btnTabLibrary.width, btnTabLibrary.height, currentTab == TAB_LIBRARY ? clrHighlight : clrBtnBg);
-        DrawBorderC2D(btnTabLibrary.x, btnTabLibrary.y, btnTabLibrary.width, btnTabLibrary.height, 1.0f, clrDisabled);
-        DrawText(btnTabLibrary.x + 40, btnTabLibrary.y + 8, 0.5f, currentTab == TAB_LIBRARY ? clrGreen : clrDisabled, btnTabLibrary.label);
+        float activeOffset = 4.0f;
+        // Playback Tab
+        C2D_DrawImageAt(imgTabPlayback, btnTabPlayback.x, 
+                        currentTab == TAB_PLAYBACK ? btnTabPlayback.y - activeOffset : btnTabPlayback.y, 
+                        0.5f, NULL, 1.0f, 1.0f);
 
-        C2D_DrawRectSolid(btnTabSettings.x, btnTabSettings.y, 0.5f, btnTabSettings.width, btnTabSettings.height, currentTab == TAB_SETTINGS ? clrHighlight : clrBtnBg);
-        DrawBorderC2D(btnTabSettings.x, btnTabSettings.y, btnTabSettings.width, btnTabSettings.height, 1.0f, clrDisabled);
-        DrawText(btnTabSettings.x + 10, btnTabSettings.y + 10, 0.45f, currentTab == TAB_SETTINGS ? clrGreen : clrDisabled, btnTabSettings.label);
+        // Library Tab
+        C2D_DrawImageAt(imgTabLibrary, btnTabLibrary.x, 
+                        currentTab == TAB_LIBRARY ? btnTabLibrary.y - activeOffset : btnTabLibrary.y, 
+                        0.5f, NULL, 1.0f, 1.0f);
+
+        // Settings Tab
+        C2D_DrawImageAt(imgTabSettings, btnTabSettings.x, 
+                        currentTab == TAB_SETTINGS ? btnTabSettings.y - activeOffset : btnTabSettings.y, 
+                        0.5f, NULL, 1.0f, 1.0f);
         
         C3D_FrameEnd(0);
     }
@@ -891,10 +1105,36 @@ int main(int argc, char **argv) {
     if (texLoaded) {
         C3D_TexDelete(&albumTex); 
     }
+    if (fontFranxurter) {
+        C2D_FontFree(fontFranxurter);
+    }
     
     C2D_TextBufDelete(g_dynamicBuf);
     C2D_Fini();
     C3D_Fini();
+    
+    if (tabImagesLoaded) {
+        C3D_TexDelete(&tabTexPlayback);
+        C3D_TexDelete(&tabTexLibrary);
+        C3D_TexDelete(&tabTexSettings);
+    }
+    // Free control textures
+    if (controlImagesLoaded) {
+        C3D_TexDelete(&texControlPlay);
+        C3D_TexDelete(&texControlPause);
+        C3D_TexDelete(&texControlNext);
+        C3D_TexDelete(&texControlPrev);
+
+        C3D_TexDelete(&texControlPlay2);
+        C3D_TexDelete(&texControlPause2);
+        C3D_TexDelete(&texControlNext2);
+        C3D_TexDelete(&texControlPrev2);
+    }
+    if (borderLoaded) {
+        C3D_TexDelete(&texBorder);
+    }
+    
+    romfsExit();
     
     curl_global_cleanup();
     socExit();
