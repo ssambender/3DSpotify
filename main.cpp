@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <stdarg.h>
-// #include <romfs.h>
 #include <curl/curl.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -16,8 +15,32 @@
 const char* CLIENT_ID = "a";
 const char* CLIENT_SECRET = "b";
 const char* REFRESH_TOKEN = "c";
+// todo - replace above with a QR code based login to save user tokens
 
-// global vars
+// multithreading vars
+Thread networkThread;
+LightLock dataLock;
+bool exitThread = false;
+
+enum NetCommand {
+    CMD_NONE,
+    CMD_FETCH_PLAYING,
+    CMD_PLAY,
+    CMD_PAUSE,
+    CMD_NEXT,
+    CMD_PREV,
+    CMD_FETCH_PLAYLISTS,
+    CMD_PLAY_CONTEXT
+};
+
+NetCommand currentCommand = CMD_NONE;
+bool isRequestPending = false;
+char commandUri[128] = "";
+
+u32* tempArtBuffer = NULL;
+bool newArtReady = false;
+
+// legacy global vars
 char currentAccessToken[512] = "";
 char lastStatus[256] = "Booting up...";
 char debugUrl[128] = "No URL yet";
@@ -31,14 +54,14 @@ long currentProgressMs = 0;
 long currentDurationMs = 0;
 u64 lastSyncTime = 0;
 
-// GPU image data
+// album cover art GPU image data
 bool texLoaded = false;
 C3D_Tex albumTex;
 C2D_Image albumImg;
 Tex3DS_SubTexture albumSubTex;
 const int TARGET_IMG_SIZE = 200; 
 
-// Tab image data
+// Tab images
 C3D_Tex tabTexPlayback, tabTexLibrary, tabTexSettings;
 C2D_Image imgTabPlayback, imgTabLibrary, imgTabSettings;
 bool tabImagesLoaded = false;
@@ -51,6 +74,12 @@ C2D_Image imgControlPlay, imgControlPause, imgControlNext, imgControlPrev;
 C2D_Image imgControlPlay2, imgControlPause2, imgControlNext2, imgControlPrev2;
 bool controlImagesLoaded = false;
 Tex3DS_SubTexture controlSubTex = { 110, 64, 9.0f / 128.0f, 1.0f, 119.0f / 128.0f, 0.0f };
+
+// folder icon
+C3D_Tex texPlaylistBar;
+C2D_Image imgPlaylistBar;
+Tex3DS_SubTexture subTexPlaylistBar;
+bool libraryUiLoaded = false;
 
 // button timers for texture changeback
 u64 prevClickedTime = 0;
@@ -71,9 +100,22 @@ const u64 FETCH_INTERVAL = 5000;
 #define SOC_ALIGN       0x1000
 #define SOC_BUFFERSIZE  0x100000
 
-// citro2d text buffer
+// citro2d text buffers
 C2D_TextBuf g_dynamicBuf;
+C2D_TextBuf g_staticBuf;
 C2D_Font fontFranxurter;
+
+// Pre-parsed static text objects
+C2D_Text txtTitlePlaylists, txtTitleSettings;
+C2D_Text txtLoading, txtNoPlaylists;
+
+// marquee text vars
+float marqueeOffset = 0.0f;
+u64 lastMarqueeTime = 0;
+const float MARQUEE_SPEED = 0.5f; // how many px per frame to scroll/move text
+const float MARQUEE_WAIT_MS = 2000; // how long to pause text before scrollibng
+u64 marqueeWaitTimer = 0;
+bool marqueePausedAtEnd = false;
 
 // tab/window state
 enum BottomTab { TAB_PLAYBACK, TAB_LIBRARY, TAB_SETTINGS };
@@ -89,9 +131,17 @@ PlaylistItem userPlaylists[MAX_PLAYLISTS];
 int numPlaylists = 0;
 bool libraryFetched = false;
 
-// tracl scrolling position
-int listScrollOffset = 0; 
-const int VISIBLE_ITEMS = 5;
+// track smooth scrolling position
+float listScrollPixels = 0.0f; 
+bool isListDragging = false;
+bool dragDidMove = false;
+s16 startTouchY = 0;
+s16 lastTouchY = 0;
+
+const float ROW_HEIGHT = 34.0f;
+const float LIST_START_Y = 3.0f;
+const float LIST_END_Y = 190.0f;
+const float VISIBLE_HEIGHT = LIST_END_Y - LIST_START_Y;
 
 // ui
 struct Button {
@@ -113,6 +163,16 @@ Button btnTabSettings = { 213, 190, 107, 45, "Settings" };
 bool isTouchInside(touchPosition touch, Button btn) {
     return (touch.px >= btn.x && touch.px <= btn.x + btn.width &&
             touch.py >= btn.y && touch.py <= btn.y + btn.height);
+}
+
+// Thread-safe status updater
+void updateStatus(const char* format, ...) {
+    LightLock_Lock(&dataLock);
+    va_list args;
+    va_start(args, format);
+    vsnprintf(lastStatus, sizeof(lastStatus), format, args);
+    va_end(args);
+    LightLock_Unlock(&dataLock);
 }
 
 // libcurl memory callback
@@ -190,9 +250,9 @@ void extractAccessToken(const char* jsonResponse) {
     extractJsonString(jsonResponse, "\"access_token\"", tempToken, sizeof(tempToken));
     if (strlen(tempToken) > 0) {
         strncpy(currentAccessToken, tempToken, sizeof(currentAccessToken));
-        sprintf(lastStatus, "Token Refreshed!");
+        updateStatus("Token Refreshed!");
     } else {
-        sprintf(lastStatus, "Error parsing token.");
+        updateStatus("Error parsing token.");
     }
 }
 
@@ -205,7 +265,7 @@ void refreshSpotifyToken() {
 
     curl = curl_easy_init();
     if(curl) {
-        sprintf(lastStatus, "Requesting token...");
+        updateStatus("Requesting token...");
         curl_easy_setopt(curl, CURLOPT_URL, "https://accounts.spotify.com/api/token");
         
         char postData[1024];
@@ -224,7 +284,7 @@ void refreshSpotifyToken() {
         if(res == CURLE_OK) {
             extractAccessToken(chunk.memory);
         } else {
-            sprintf(lastStatus, "Curl error: %s", curl_easy_strerror(res));
+            updateStatus("Curl error: %s", curl_easy_strerror(res));
         }
 
         curl_easy_cleanup(curl);
@@ -234,12 +294,14 @@ void refreshSpotifyToken() {
 
 void fetchPlaylists() {
     if (strlen(currentAccessToken) == 0) {
-        sprintf(lastStatus, "No Token!");
+        updateStatus("No Token!");
+        LightLock_Lock(&dataLock);
         libraryFetched = true;
+        LightLock_Unlock(&dataLock);
         return;
     }
 
-    sprintf(lastStatus, "Fetching Library...");
+    updateStatus("Fetching Library...");
     
     CURL *curl = curl_easy_init();
     struct MemoryStruct chunk;
@@ -266,39 +328,53 @@ void fetchPlaylists() {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             
             if (response_code == 200) {
-                numPlaylists = 0;
-                listScrollOffset = 0; // reset scroll position on fetch new
+                PlaylistItem tempPlaylists[MAX_PLAYLISTS];
+                int tempNum = 0;
+
                 char* itemPtr = strstr(chunk.memory, "\"items\"");
                 
-                while (itemPtr != NULL && numPlaylists < MAX_PLAYLISTS) {
+                while (itemPtr != NULL && tempNum < MAX_PLAYLISTS) {
                     char* namePtr = strstr(itemPtr, "\"name\"");
                     if (!namePtr) break;
                     
                     char* uriPtr = strstr(namePtr, "spotify:playlist:");
                     if (!uriPtr) break;
 
-                    extractJsonString(namePtr, "\"name\"", userPlaylists[numPlaylists].name, sizeof(userPlaylists[0].name));
+                    extractJsonString(namePtr, "\"name\"", tempPlaylists[tempNum].name, sizeof(tempPlaylists[0].name));
                     
                     char* quoteEnd = strchr(uriPtr, '\"');
                     if (quoteEnd) {
                         int len = quoteEnd - uriPtr;
                         if (len > 127) len = 127;
-                        strncpy(userPlaylists[numPlaylists].uri, uriPtr, len);
-                        userPlaylists[numPlaylists].uri[len] = '\0';
+                        strncpy(tempPlaylists[tempNum].uri, uriPtr, len);
+                        tempPlaylists[tempNum].uri[len] = '\0';
                     }
 
-                    numPlaylists++;
+                    tempNum++;
                     itemPtr = uriPtr + 17; 
                 }
-                sprintf(lastStatus, "Library loaded: %d", numPlaylists);
+
+                LightLock_Lock(&dataLock);
+                numPlaylists = tempNum;
+                listScrollPixels = 0.0f; // reset scroll on load
+                for(int i=0; i<tempNum; i++){
+                    userPlaylists[i] = tempPlaylists[i];
+                }
+                libraryFetched = true;
+                LightLock_Unlock(&dataLock);
+
+                updateStatus("Library loaded: %d", tempNum);
             } else {
-                sprintf(lastStatus, "Lib API Err: %ld", response_code);
+                updateStatus("Lib API Err: %ld", response_code);
             }
         } else {
-            sprintf(lastStatus, "Lib Net Err: %d", res);
+            updateStatus("Lib Net Err: %d", res);
         }
         
+        LightLock_Lock(&dataLock);
         libraryFetched = true; 
+        LightLock_Unlock(&dataLock);
+
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
     }
@@ -314,7 +390,7 @@ u32 morton_index(u32 x, u32 y, u32 width) {
 }
 
 void fetchCoverArt(const char* url) {
-    sprintf(lastStatus, "Fetching Art...");
+    updateStatus("Fetching Art...");
     
     CURL *curl = curl_easy_init();
     if(!curl) return;
@@ -339,54 +415,45 @@ void fetchCoverArt(const char* url) {
         u8* rawPixels = stbi_load_from_memory((const stbi_uc*)chunk.memory, chunk.size, &origW, &origH, &channels, 4);
         
         if (rawPixels) {
-            
-            // ensure image is power of 2 tex
-            if (!texLoaded) {
-                C3D_TexInit(&albumTex, 256, 256, GPU_RGBA8);
-                C3D_TexSetFilter(&albumTex, GPU_LINEAR, GPU_NEAREST);
-                texLoaded = true;
-            }
-            
-            u32* vramTexData = (u32*)albumTex.data;
-            memset(vramTexData, 0, 256 * 256 * 4);
-            
-            // downscale and save to gpu memory
-            for (int y = 0; y < TARGET_IMG_SIZE; y++) {
-                for (int x = 0; x < TARGET_IMG_SIZE; x++) {
-                    int srcX = (x * origW) / TARGET_IMG_SIZE;
-                    int srcY = (y * origH) / TARGET_IMG_SIZE;
-                    
-                    int srcIdx = (srcY * origW + srcX) * 4;
-                    
-                    u8 r = rawPixels[srcIdx + 0];
-                    u8 g = rawPixels[srcIdx + 1];
-                    u8 b = rawPixels[srcIdx + 2];
-                    u8 a = rawPixels[srcIdx + 3];
-                    
-                    // citro3d GPU_RGBA8
-                    u32 color = (r << 24) | (g << 16) | (b << 8) | a;
-                    vramTexData[morton_index(x, y, 256)] = color;
+            u32* tempVramData = (u32*)linearAlloc(256 * 256 * 4);
+            if (tempVramData) {
+                memset(tempVramData, 0, 256 * 256 * 4);
+                
+                // downscale and swizzle for GPU memory
+                for (int y = 0; y < TARGET_IMG_SIZE; y++) {
+                    for (int x = 0; x < TARGET_IMG_SIZE; x++) {
+                        int srcX = (x * origW) / TARGET_IMG_SIZE;
+                        int srcY = (y * origH) / TARGET_IMG_SIZE;
+                        int srcIdx = (srcY * origW + srcX) * 4;
+                        
+                        u8 r = rawPixels[srcIdx + 0];
+                        u8 g = rawPixels[srcIdx + 1];
+                        u8 b = rawPixels[srcIdx + 2];
+                        u8 a = rawPixels[srcIdx + 3];
+                        
+                        u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+                        tempVramData[morton_index(x, y, 256)] = color;
+                    }
                 }
+
+                stbi_image_free(rawPixels);
+
+                LightLock_Lock(&dataLock);
+                if (tempArtBuffer) linearFree(tempArtBuffer);
+                tempArtBuffer = tempVramData;
+                newArtReady = true;
+                LightLock_Unlock(&dataLock);
+                
+                updateStatus("Art decoded, ready for GPU");
+            } else {
+                stbi_image_free(rawPixels);
+                updateStatus("LinearAlloc failed for art");
             }
-
-            // define visual wrapper
-            albumSubTex.width = TARGET_IMG_SIZE;
-            albumSubTex.height = TARGET_IMG_SIZE;
-            albumSubTex.left = 0.0f;
-            albumSubTex.top = 1.0f; 
-            albumSubTex.right = TARGET_IMG_SIZE / 256.0f;
-            albumSubTex.bottom = 1.0f - (TARGET_IMG_SIZE / 256.0f);
-
-            albumImg.tex = &albumTex;
-            albumImg.subtex = &albumSubTex;
-
-            stbi_image_free(rawPixels);
-            sprintf(lastStatus, "Art updated successfully");
         } else {
-            sprintf(lastStatus, "Art decode failed");
+            updateStatus("Art decode failed");
         }
     } else {
-        sprintf(lastStatus, "Art DL error: %d", res);
+        updateStatus("Art DL error: %d", res);
     }
 
     curl_easy_cleanup(curl);
@@ -424,76 +491,102 @@ void fetchCurrentlyPlaying() {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             
             if (response_code == 200 && chunk.size > 0) {
-                isPlaying = extractJsonBool(chunk.memory, "\"is_playing\"");
+                bool localIsPlaying = extractJsonBool(chunk.memory, "\"is_playing\"");
+                long localProgress = extractJsonLong(chunk.memory, "\"progress_ms\"");
+                char localArtist[128] = "";
+                char localSong[128] = "";
+                long localDuration = 0;
+                char newSongId[128] = "";
                 
-                currentProgressMs = extractJsonLong(chunk.memory, "\"progress_ms\"");
-                lastSyncTime = osGetTime();
-
                 char* artistsBlock = strstr(chunk.memory, "\"artists\"");
-                if (artistsBlock) {
-                    extractJsonString(artistsBlock, "\"name\"", currentArtist, sizeof(currentArtist));
-                }
+                if (artistsBlock) extractJsonString(artistsBlock, "\"name\"", localArtist, sizeof(localArtist));
+                
+                bool shouldFetchArt = false;
+                char targetUrl[512] = "";
 
                 char* trackAnchor = strstr(chunk.memory, "\"duration_ms\"");
                 if (trackAnchor) {
-                    currentDurationMs = extractJsonLong(trackAnchor, "\"duration_ms\"");
-                    
-                    char newSongId[128] = "";
+                    localDuration = extractJsonLong(trackAnchor, "\"duration_ms\"");
                     extractJsonString(trackAnchor, "\"id\"", newSongId, sizeof(newSongId));
-                    extractJsonString(trackAnchor, "\"name\"", currentSong, sizeof(currentSong));
-
+                    extractJsonString(trackAnchor, "\"name\"", localSong, sizeof(localSong));
+                    
+                    LightLock_Lock(&dataLock);
                     if (strlen(newSongId) > 0 && strcmp(newSongId, currentSongId) != 0) {
+                        shouldFetchArt = true;
                         strcpy(currentSongId, newSongId);
+                    }
+                    LightLock_Unlock(&dataLock);
 
+                    if (shouldFetchArt) {
                         char* albumBlock = strstr(chunk.memory, "\"album\"");
                         char* imagesBlock = albumBlock ? strstr(albumBlock, "\"images\"") : NULL;
                         
-                        char newCoverUrl[512] = "";
+                        marqueeOffset = 0.0f;
+                        marqueePausedAtEnd = false;
+                        marqueeWaitTimer = osGetTime() + 1000;
+
                         if (imagesBlock) {
                             char* current = imagesBlock;
-                            char* targetUrl = NULL;
+                            char* bestUrl = NULL;
                             int urlCount = 0;
                             char* endArray = strchr(imagesBlock, ']');
                             
                             while ((current = strstr(current, "\"url\"")) != NULL && (!endArray || current < endArray)) {
                                 urlCount++;
                                 if (urlCount == 2) { 
-                                    targetUrl = current;
+                                    bestUrl = current;
                                     break;
                                 }
                                 current += 5; 
                             }
                             
-                            if (!targetUrl && urlCount == 1) {
-                                targetUrl = strstr(imagesBlock, "\"url\"");
-                            }
+                            if (!bestUrl && urlCount == 1) bestUrl = strstr(imagesBlock, "\"url\"");
                             
-                            if (targetUrl) {
-                                extractJsonString(targetUrl, "\"url\"", newCoverUrl, sizeof(newCoverUrl));
-                                unescapeUrl(newCoverUrl); 
+                            if (bestUrl) {
+                                extractJsonString(bestUrl, "\"url\"", targetUrl, sizeof(targetUrl));
+                                unescapeUrl(targetUrl); 
                             }
                         }
+                    }
+                }
 
-                        if (strlen(newCoverUrl) > 0) {
-                            snprintf(debugUrl, sizeof(debugUrl), "%.46s...", newCoverUrl);
-                            fetchCoverArt(newCoverUrl);
-                        } else {
-                            strcpy(debugUrl, "None found");
-                            sprintf(lastStatus, "No Art URL found");
-                        }
+                // update all playback state
+                LightLock_Lock(&dataLock);
+                isPlaying = localIsPlaying;
+                currentProgressMs = localProgress;
+                currentDurationMs = localDuration;
+                if (strlen(localArtist) > 0) strcpy(currentArtist, localArtist);
+                if (strlen(localSong) > 0) strcpy(currentSong, localSong);
+                lastSyncTime = osGetTime();
+                LightLock_Unlock(&dataLock);
+                
+                // fetch cover art if song changed
+                if (shouldFetchArt) {
+                    if (strlen(targetUrl) > 0) {
+                        LightLock_Lock(&dataLock);
+                        snprintf(debugUrl, sizeof(debugUrl), "%.46s...", targetUrl);
+                        LightLock_Unlock(&dataLock);
+                        fetchCoverArt(targetUrl);
+                    } else {
+                        LightLock_Lock(&dataLock);
+                        strcpy(debugUrl, "None found");
+                        LightLock_Unlock(&dataLock);
+                        updateStatus("No Art URL found");
                     }
                 }
                 
             } else if (response_code == 204) {
+                LightLock_Lock(&dataLock);
                 strcpy(currentSong, "Nothing playing");
                 strcpy(currentArtist, "");
                 strcpy(currentSongId, "");
                 isPlaying = false;
                 currentProgressMs = 0;
                 currentDurationMs = 0;
+                LightLock_Unlock(&dataLock);
             }
         } else {
-             sprintf(lastStatus, "Net Err: %d", res);
+             updateStatus("Net Err: %d", res);
         }
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -503,7 +596,7 @@ void fetchCurrentlyPlaying() {
 
 void sendSpotifyCommand(const char* endpoint, const char* method) {
     if (strlen(currentAccessToken) == 0) {
-        sprintf(lastStatus, "No Token! Restart app.");
+        updateStatus("No Token! Restart app.");
         return;
     }
 
@@ -535,13 +628,13 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
             long response_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             if(response_code == 204 || response_code == 200) {
-                sprintf(lastStatus, "Success: %s", endpoint);
+                updateStatus("Success: %s", endpoint);
                 lastFetchTime = osGetTime() - FETCH_INTERVAL + 500; 
             } else {
-                sprintf(lastStatus, "API Error: %ld", response_code);
+                updateStatus("API Error: %ld", response_code);
             }
         } else {
-            sprintf(lastStatus, "Net Error: %s", curl_easy_strerror(res));
+            updateStatus("Net Error: %s", curl_easy_strerror(res));
         }
 
         curl_slist_free_all(headers);
@@ -552,7 +645,7 @@ void sendSpotifyCommand(const char* endpoint, const char* method) {
 void playContext(const char* contextUri) {
     if (strlen(currentAccessToken) == 0) return;
 
-    sprintf(lastStatus, "Starting playlist...");
+    updateStatus("Starting playlist...");
     
     CURL *curl = curl_easy_init();
     if(curl) {
@@ -580,18 +673,56 @@ void playContext(const char* contextUri) {
             long response_code;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
             if(response_code == 204 || response_code == 200) {
-                sprintf(lastStatus, "Playlist Started!");
+                updateStatus("Playlist Started!");
+                LightLock_Lock(&dataLock);
                 isPlaying = true;
+                LightLock_Unlock(&dataLock);
                 lastFetchTime = osGetTime() - FETCH_INTERVAL + 500; 
             } else {
-                sprintf(lastStatus, "Play Error: %ld", response_code);
+                updateStatus("Play Error: %ld", response_code);
             }
         } else {
-            sprintf(lastStatus, "Net Error: %s", curl_easy_strerror(res));
+            updateStatus("Net Error: %s", curl_easy_strerror(res));
         }
 
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
+    }
+}
+
+// thread worker for network / async calls
+void networkWorker(void* arg) {
+    while (!exitThread) {
+        NetCommand cmd = CMD_NONE;
+        char localUri[128] = "";
+
+        // check if main thread gave us a job
+        LightLock_Lock(&dataLock);
+        if (currentCommand != CMD_NONE) {
+            cmd = currentCommand;
+            strcpy(localUri, commandUri);
+            currentCommand = CMD_NONE;
+        }
+        LightLock_Unlock(&dataLock);
+
+        if (cmd != CMD_NONE) {
+            // execute any slow network calls OUTSIDE the lock
+            if (cmd == CMD_FETCH_PLAYING) fetchCurrentlyPlaying();
+            else if (cmd == CMD_PLAY) sendSpotifyCommand("/play", "PUT");
+            else if (cmd == CMD_PAUSE) sendSpotifyCommand("/pause", "PUT");
+            else if (cmd == CMD_NEXT) sendSpotifyCommand("/next", "POST");
+            else if (cmd == CMD_PREV) sendSpotifyCommand("/previous", "POST");
+            else if (cmd == CMD_FETCH_PLAYLISTS) fetchPlaylists();
+            else if (cmd == CMD_PLAY_CONTEXT) playContext(localUri);
+
+            // tell  main thread we finished
+            LightLock_Lock(&dataLock);
+            isRequestPending = false;
+            LightLock_Unlock(&dataLock);
+        }
+
+        // sleep for 10ms to prevent eating CPU
+        svcSleepThread(10000000ULL); 
     }
 }
 
@@ -619,7 +750,6 @@ void DrawTextCentered(C2D_Font font, float y, float size, u32 color, const char*
     
     C2D_Text textObj;
     
-    // Check if a custom font was passed
     if (font) {
         C2D_TextFontParse(&textObj, font, g_dynamicBuf, buffer);
     } else {
@@ -628,14 +758,68 @@ void DrawTextCentered(C2D_Font font, float y, float size, u32 color, const char*
     
     C2D_TextOptimize(&textObj);
     
-    // get dimensions of the text
     float textWidth, textHeight;
     C2D_TextGetDimensions(&textObj, size, size, &textWidth, &textHeight);
     
-    // calculate centered X (top center is 200)
     float x = 200.0f - (textWidth / 2.0f);
-    
     C2D_DrawText(&textObj, C2D_WithColor, x, y, 0.5f, size, size, color);
+}
+
+void DrawTextMarquee(C2D_Font font, float y, float size, u32 color, float maxW, const char* format, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    C2D_Text textObj;
+    if (font) C2D_TextFontParse(&textObj, font, g_dynamicBuf, buffer);
+    else C2D_TextParse(&textObj, g_dynamicBuf, buffer);
+    C2D_TextOptimize(&textObj);
+
+    float textWidth, textHeight;
+    C2D_TextGetDimensions(&textObj, size, size, &textWidth, &textHeight);
+
+    float windowLeftEdge = (400.0f - maxW) / 2.0f;
+
+    // only scroll if text is wider than window
+    if (textWidth <= maxW) {
+        float centerX = 200.0f - (textWidth / 2.0f);
+        C2D_DrawText(&textObj, C2D_WithColor, centerX, y, 0.5f, size, size, color);
+    } else {
+        float maxTravel = textWidth - maxW;
+        u64 currentTime = osGetTime();
+
+        if (currentTime > marqueeWaitTimer) {
+            if (marqueePausedAtEnd) {
+                marqueeOffset = 0.0f;
+                marqueePausedAtEnd = false;
+                // add a 1-second pause at the start before moving again
+                marqueeWaitTimer = currentTime + 1000; 
+            } else {
+                marqueeOffset += MARQUEE_SPEED;
+
+                if (marqueeOffset >= maxTravel) {
+                    marqueeOffset = maxTravel;
+                    marqueePausedAtEnd = true;
+                    // pause for 1 second at the end
+                    marqueeWaitTimer = currentTime + 1000; 
+                }
+            }
+        }
+
+        float renderX = windowLeftEdge - marqueeOffset;
+
+        C2D_Flush(); 
+        int winX = (int)windowLeftEdge;
+        int winW = (int)maxW;
+        
+        // scissor text so doesnt draw text outside window during marquyee scroll
+        C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 400 - (winX + winW), 240, 400 - winX);
+        C2D_DrawText(&textObj, C2D_WithColor, renderX, y, 0.5f, size, size, color);
+        C2D_Flush();
+        C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0); 
+    }
 }
 
 // draw borders w/ citro2d
@@ -651,7 +835,6 @@ void loadControlTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
     unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
     if (!data) return;
 
-    // fixed canvas size packed for GPU
     C3D_TexInit(tex, 128, 64, GPU_RGBA8); 
     C3D_TexSetFilter(tex, GPU_LINEAR, GPU_NEAREST); 
     
@@ -679,7 +862,6 @@ void loadControlTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
 
 void loadTabTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
     int width, height, channels;
-    // load from romfs
     unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
     if (!data) return;
 
@@ -738,6 +920,65 @@ void loadBorderTexture(C3D_Tex* tex, C2D_Image* img, const char* path) {
     stbi_image_free(data);
 }
 
+void loadDynamicTexture(C3D_Tex* tex, C2D_Image* img, Tex3DS_SubTexture* subtex, const char* path, int vramW, int vramH) {
+    int width, height, channels;
+    unsigned char* data = stbi_load(path, &width, &height, &channels, 4);
+    if (!data) return;
+
+    C3D_TexInit(tex, vramW, vramH, GPU_RGBA8); 
+    C3D_TexSetFilter(tex, GPU_LINEAR, GPU_NEAREST);
+    
+    u32* vram = (u32*)tex->data;
+    memset(vram, 0, vramW * vramH * 4); 
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int srcIdx = (y * width + x) * 4;
+            // Pack RGBA
+            u32 color = (data[srcIdx + 0] << 24) | (data[srcIdx + 1] << 16) | (data[srcIdx + 2] << 8) | data[srcIdx + 3];
+            vram[morton_index(x, y, vramW)] = color;
+        }
+    }
+
+    // automatically map the subtexture to the actual image dimensions
+    subtex->width = width;
+    subtex->height = height;
+    subtex->left = 0.0f;
+    subtex->top = 1.0f;
+    subtex->right = (float)width / (float)vramW;
+    subtex->bottom = 1.0f - ((float)height / (float)vramH);
+
+    img->tex = tex;
+    img->subtex = subtex;
+    
+    stbi_image_free(data);
+}
+
+// replace non-standard characters with ?
+void sanitizeText(char* str) {
+    int i = 0, j = 0;
+    while (str[i] != '\0') {
+        unsigned char c = str[i];
+        
+        if (c >= 32 && c <= 126) {
+            str[j++] = str[i++];
+        } 
+        else if (c >= 192) {
+            str[j++] = '?';
+            
+            if ((c & 0xE0) == 0xC0) i += 2;      // 2-byte
+            else if ((c & 0xF0) == 0xE0) i += 3; // 3-byte
+            else if ((c & 0xF8) == 0xF0) i += 4; // 4-byte
+            else i++;
+        } 
+        else {
+            str[j++] = '?';
+            i++;
+        }
+    }
+    str[j] = '\0';
+}
+
 int main(int argc, char **argv) {
     // init standard services
     gfxInitDefault();
@@ -746,6 +987,11 @@ int main(int argc, char **argv) {
         printf("Failed to initialize SOC service!\n");
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    LightLock_Init(&dataLock);
+    
+    // create background thread
+    networkThread = threadCreate(networkWorker, NULL, 32 * 1024, 0x30, -2, false);
 
     // init GPU and 2D graphics engine
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
@@ -756,27 +1002,38 @@ int main(int argc, char **argv) {
     C3D_RenderTarget* topTarget = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     C3D_RenderTarget* bottomTarget = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
-    // create text buffer
+    // create text buffers
     g_dynamicBuf = C2D_TextBufNew(4096);
+    g_staticBuf = C2D_TextBufNew(1024);
+
+    // Parse static text to save CPU cycles
+    C2D_TextParse(&txtTitleSettings, g_staticBuf, "Settings & Debug");
+    C2D_TextOptimize(&txtTitleSettings);
+    C2D_TextParse(&txtLoading, g_staticBuf, "Loading...");
+    C2D_TextOptimize(&txtLoading);
+    C2D_TextParse(&txtNoPlaylists, g_staticBuf, "No playlists found. Tap tab to retry.");
+    C2D_TextOptimize(&txtNoPlaylists);
 
     // HEX to citro2d colors
-    // u32 clrBg       = C2D_Color32(18, 18, 18, 255);     // #121212
-    u32 clrGreen    = C2D_Color32(49, 49, 49, 255);    // rgb(49, 49, 49)
-    u32 clrBtnBg    = C2D_Color32(225, 221, 209, 255);     // rgb(225, 221, 209)
-    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);     // #555555
-    // u32 clrHighlight = C2D_Color32(50, 50, 50, 255);    // #323232
+    u32 clrGreen    = C2D_Color32(49, 49, 49, 255);
+    u32 clrPlaylistText = C2D_Color32(86, 81, 72, 255);
+    // u32 clrBtnBg    = C2D_Color32(225, 221, 209, 0);
+    u32 clrDisabled = C2D_Color32(85, 85, 85, 255);
+    u32 clrBlack    = C2D_Color32(0, 0, 0, 255);
 
-    u32 clrBlack     = C2D_Color32(0, 0, 0, 255);
-    // u32 clrWhite = C2D_Color32(255, 255, 255, 255);
-
-    // BG colors for citro2d
-    u32 clrCheck1    = C2D_Color32(161, 225, 245, 255); // #A1E1F5
-    u32 clrCheck2    = C2D_Color32(186, 234, 249, 255); // #BAEAF9
-    u32 clrGradTop   = C2D_Color32(220, 248, 222, 255); // #DCF8DE
-    u32 clrGradBot   = C2D_Color32(180, 237, 195, 255); // #B4EDC3
+    u32 clrCheck1    = C2D_Color32(161, 225, 245, 255);
+    u32 clrCheck2    = C2D_Color32(186, 234, 249, 255);
+    u32 clrGradTop   = C2D_Color32(220, 248, 222, 255);
+    u32 clrGradBot   = C2D_Color32(180, 237, 195, 255);
 
     refreshSpotifyToken();
-    fetchCurrentlyPlaying();
+    
+    // Dispatch initial fetch to the background thread
+    LightLock_Lock(&dataLock);
+    currentCommand = CMD_FETCH_PLAYING;
+    isRequestPending = true;
+    LightLock_Unlock(&dataLock);
+    
     lastFetchTime = osGetTime();
 
     bool touchLock = false;
@@ -791,7 +1048,7 @@ int main(int argc, char **argv) {
     loadTabTexture(&tabTexSettings, &imgTabSettings, "romfs:/tab_settings.png");
     tabImagesLoaded = true;
 
-    // Load new control buttons
+    // load control buttons
     loadControlTexture(&texControlPlay, &imgControlPlay, "romfs:/control_play.png");
     loadControlTexture(&texControlPause, &imgControlPause, "romfs:/control_pause.png");
     loadControlTexture(&texControlNext, &imgControlNext, "romfs:/control_next.png");
@@ -807,10 +1064,15 @@ int main(int argc, char **argv) {
     loadBorderTexture(&texBorder, &imgBorder, "romfs:/art_border.png");
     borderLoaded = true;
 
+    // load library sprites
+    loadDynamicTexture(&texPlaylistBar, &imgPlaylistBar, &subTexPlaylistBar, "romfs:/playlistBar.png", 1024, 128);
+    libraryUiLoaded = true;
+
     while (aptMainLoop()) {
         hidScanInput();
         u32 kDown = hidKeysDown();
         u32 kHeld = hidKeysHeld();
+        u32 kUp   = hidKeysUp();
 
         if (kDown & KEY_START) break;
 
@@ -828,62 +1090,93 @@ int main(int argc, char **argv) {
 
         // fetch playlist on library tab
         if ((kDown & KEY_L) || (kDown & KEY_R)) {
-            if (currentTab == TAB_LIBRARY && (!libraryFetched || numPlaylists == 0)) {
-                fetchPlaylists(); 
+            bool localFetched;
+            int localNumPlaylists;
+            LightLock_Lock(&dataLock);
+            localFetched = libraryFetched;
+            localNumPlaylists = numPlaylists;
+            LightLock_Unlock(&dataLock);
+            
+            if (currentTab == TAB_LIBRARY && (!localFetched || localNumPlaylists == 0)) {
+                LightLock_Lock(&dataLock);
+                if (!isRequestPending) {
+                    currentCommand = CMD_FETCH_PLAYLISTS;
+                    isRequestPending = true;
+                }
+                LightLock_Unlock(&dataLock);
             }
         }
 
-        // scroll list
-        if (currentTab == TAB_LIBRARY && numPlaylists > VISIBLE_ITEMS) {
-            int maxOffset = numPlaylists - VISIBLE_ITEMS;
-            
-            // D-PAD DOWN
-            if ((kDown & KEY_DDOWN) || (kDown & KEY_CPAD_DOWN)) {
-                if (listScrollOffset < maxOffset) {
-                    listScrollOffset++;
-                } else {
-                    listScrollOffset = 0; // loop back to top
-                }
+        // dpad / circle pad
+        int currentNumPlaylists;
+        LightLock_Lock(&dataLock);
+        currentNumPlaylists = numPlaylists;
+        LightLock_Unlock(&dataLock);
+
+        float maxScrollPixels = (currentNumPlaylists * ROW_HEIGHT) - VISIBLE_HEIGHT;
+        if (maxScrollPixels < 0) maxScrollPixels = 0.0f;
+
+        if (currentTab == TAB_LIBRARY && currentNumPlaylists > 0) {
+            if ((kHeld & KEY_DDOWN) || (kHeld & KEY_CPAD_DOWN)) {
+                listScrollPixels += 4.0f; // scroll speed
+                if (listScrollPixels > maxScrollPixels) listScrollPixels = maxScrollPixels;
             }
-            // D-PAD UP
-            if ((kDown & KEY_DUP) || (kDown & KEY_CPAD_UP)) {
-                if (listScrollOffset > 0) {
-                    listScrollOffset--;
-                } else {
-                    listScrollOffset = maxOffset; // loop to bottom
-                }
+            if ((kHeld & KEY_DUP) || (kHeld & KEY_CPAD_UP)) {
+                listScrollPixels -= 4.0f;
+                if (listScrollPixels < 0.0f) listScrollPixels = 0.0f;
             }
-            // D-PAD RIGHT
             if ((kDown & KEY_DRIGHT) || (kDown & KEY_CPAD_RIGHT)) {
-                if (listScrollOffset == maxOffset) {
-                    listScrollOffset = 0; // loop back to top
-                } else {
-                    listScrollOffset += VISIBLE_ITEMS;
-                    if (listScrollOffset > maxOffset) listScrollOffset = maxOffset;
-                }
+                listScrollPixels += VISIBLE_HEIGHT;
+                if (listScrollPixels > maxScrollPixels) listScrollPixels = maxScrollPixels;
             }
-            // D-PAD LEFT
             if ((kDown & KEY_DLEFT) || (kDown & KEY_CPAD_LEFT)) {
-                if (listScrollOffset == 0) {
-                    listScrollOffset = maxOffset; // loop to bottom
-                } else {
-                    listScrollOffset -= VISIBLE_ITEMS;
-                    if (listScrollOffset < 0) listScrollOffset = 0;
-                }
+                listScrollPixels -= VISIBLE_HEIGHT;
+                if (listScrollPixels < 0.0f) listScrollPixels = 0.0f;
             }
         }
 
         u64 currentTime = osGetTime();
         if (currentTime - lastFetchTime >= FETCH_INTERVAL) {
-            fetchCurrentlyPlaying();
+            LightLock_Lock(&dataLock);
+            if (!isRequestPending) {
+                currentCommand = CMD_FETCH_PLAYING;
+                isRequestPending = true;
+            }
+            LightLock_Unlock(&dataLock);
             lastFetchTime = currentTime;
         }
 
-        if (kHeld & KEY_TOUCH) {
-            if (!touchLock) {
-                touchPosition touch;
-                hidTouchRead(&touch);
+        // touch screen drag
+        if (kDown & KEY_TOUCH) {
+            touchPosition touch;
+            hidTouchRead(&touch);
+            startTouchY = touch.py;
+            lastTouchY = touch.py;
+            dragDidMove = false;
+            
+            if (currentTab == TAB_LIBRARY && touch.py <= LIST_END_Y) {
+                isListDragging = true;
+            }
+        }
 
+        if (kHeld & KEY_TOUCH) {
+            touchPosition touch;
+            hidTouchRead(&touch);
+
+            if (currentTab == TAB_LIBRARY && isListDragging) {
+                int deltaY = touch.py - lastTouchY;
+                
+                if (abs(touch.py - startTouchY) > 5) dragDidMove = true;
+                
+                if (dragDidMove) {
+                    listScrollPixels -= deltaY;
+                    if (listScrollPixels < 0.0f) listScrollPixels = 0.0f;
+                    if (listScrollPixels > maxScrollPixels) listScrollPixels = maxScrollPixels;
+                }
+                lastTouchY = touch.py;
+            }
+
+            if (!touchLock) {
                 // tab switching
                 if (isTouchInside(touch, btnTabPlayback)) {
                     currentTab = TAB_PLAYBACK;
@@ -891,8 +1184,20 @@ int main(int argc, char **argv) {
                 }
                 else if (isTouchInside(touch, btnTabLibrary)) {
                     currentTab = TAB_LIBRARY;
-                    if (!libraryFetched || numPlaylists == 0) {
-                        fetchPlaylists(); 
+                    bool localFetched;
+                    int localNum;
+                    LightLock_Lock(&dataLock);
+                    localFetched = libraryFetched;
+                    localNum = numPlaylists;
+                    LightLock_Unlock(&dataLock);
+                    
+                    if (!localFetched || localNum == 0) {
+                        LightLock_Lock(&dataLock);
+                        if (!isRequestPending) {
+                            currentCommand = CMD_FETCH_PLAYLISTS;
+                            isRequestPending = true;
+                        }
+                        LightLock_Unlock(&dataLock);
                     }
                     touchLock = true;
                 }
@@ -903,59 +1208,145 @@ int main(int argc, char **argv) {
 
                 // playback controls tab
                 if (currentTab == TAB_PLAYBACK && touchLock == false) {
+                    bool localPlaying;
+                    LightLock_Lock(&dataLock);
+                    localPlaying = isPlaying;
+                    LightLock_Unlock(&dataLock);
+
                     if (isTouchInside(touch, btnPrev)) {
-                        sprintf(lastStatus, "Sending: Previous...");
-                        currentProgressMs = 0; 
-                        lastSyncTime = osGetTime();
-                        prevClickedTime = osGetTime();
-                        sendSpotifyCommand("/previous", "POST");
+                        updateStatus("Sending: Previous...");
+                        LightLock_Lock(&dataLock);
+                        if (!isRequestPending) {
+                            currentProgressMs = 0; 
+                            lastSyncTime = osGetTime();
+                            prevClickedTime = osGetTime();
+                            
+                            currentCommand = CMD_PREV;
+                            isRequestPending = true;
+                        }
+                        LightLock_Unlock(&dataLock);
                         touchLock = true;
                     } 
-                    else if (isTouchInside(touch, btnPause) && isPlaying) {
-                        sprintf(lastStatus, "Sending: Pause...");
-                        isPlaying = false;
-                        currentProgressMs += (osGetTime() - lastSyncTime); 
-                        lastSyncTime = osGetTime();
-                        pauseClickedTime = osGetTime();
-                        sendSpotifyCommand("/pause", "PUT");
+                    else if (isTouchInside(touch, btnPause) && localPlaying) {
+                        updateStatus("Sending: Pause...");
+                        LightLock_Lock(&dataLock);
+                        if (!isRequestPending) {
+                            isPlaying = false;
+                            currentProgressMs += (osGetTime() - lastSyncTime); 
+                            lastSyncTime = osGetTime();
+                            pauseClickedTime = osGetTime();
+                            
+                            currentCommand = CMD_PAUSE;
+                            isRequestPending = true;
+                        }
+                        LightLock_Unlock(&dataLock);
                         touchLock = true;
                     } 
-                    else if (isTouchInside(touch, btnPlay) && !isPlaying) {
-                        sprintf(lastStatus, "Sending: Play...");
-                        isPlaying = true;
-                        lastSyncTime = osGetTime(); 
-                        playClickedTime = osGetTime();
-                        sendSpotifyCommand("/play", "PUT");
+                    else if (isTouchInside(touch, btnPlay) && !localPlaying) {
+                        updateStatus("Sending: Play...");
+                        LightLock_Lock(&dataLock);
+                        if (!isRequestPending) {
+                            isPlaying = true;
+                            lastSyncTime = osGetTime(); 
+                            playClickedTime = osGetTime();
+                            
+                            currentCommand = CMD_PLAY;
+                            isRequestPending = true;
+                        }
+                        LightLock_Unlock(&dataLock);
                         touchLock = true;
                     }
                     else if (isTouchInside(touch, btnNext)) {
-                        sprintf(lastStatus, "Sending: Next...");
-                        currentProgressMs = 0; 
-                        lastSyncTime = osGetTime();
-                        nextClickedTime = osGetTime();
-                        sendSpotifyCommand("/next", "POST");
-                        touchLock = true;
-                    }
-                }
-                
-                // library/playlist tab
-                if (currentTab == TAB_LIBRARY && touchLock == false) {
-                    int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
-                    for (int i = 0; i < displayCount; i++) {
-                        Button row = {10, (s16)(45 + (i * 26)), 300, 22, ""};
-                        if (isTouchInside(touch, row)) {
-                            int actualDataIndex = listScrollOffset + i;
-                            playContext(userPlaylists[actualDataIndex].uri);
-                            touchLock = true;
-                            currentTab = TAB_PLAYBACK; 
-                            break;
+                        updateStatus("Sending: Next...");
+                        LightLock_Lock(&dataLock);
+                        if (!isRequestPending) {
+                            currentProgressMs = 0; 
+                            lastSyncTime = osGetTime();
+                            nextClickedTime = osGetTime();
+                            
+                            currentCommand = CMD_NEXT;
+                            isRequestPending = true;
                         }
+                        LightLock_Unlock(&dataLock);
+                        touchLock = true;
                     }
                 }
             }
         } else {
             touchLock = false;
         }
+
+        if (kUp & KEY_TOUCH) {
+            if (currentTab == TAB_LIBRARY && isListDragging && !dragDidMove) {
+                float absoluteY = (startTouchY - LIST_START_Y) + listScrollPixels;
+                int clickedIndex = absoluteY / ROW_HEIGHT;
+                
+                if (clickedIndex >= 0 && clickedIndex < currentNumPlaylists) {
+                    LightLock_Lock(&dataLock);
+                    if (!isRequestPending) {
+                        strncpy(commandUri, userPlaylists[clickedIndex].uri, 127);
+                        commandUri[127] = '\0';
+                        currentCommand = CMD_PLAY_CONTEXT;
+                        isRequestPending = true;
+                    }
+                    LightLock_Unlock(&dataLock);
+                    
+                    touchLock = true;
+                    currentTab = TAB_PLAYBACK;
+                }
+            }
+            isListDragging = false;
+            dragDidMove = false;
+        }
+
+        LightLock_Lock(&dataLock);
+        if (newArtReady && tempArtBuffer) {
+            if (!texLoaded) {
+                C3D_TexInit(&albumTex, 256, 256, GPU_RGBA8);
+                C3D_TexSetFilter(&albumTex, GPU_LINEAR, GPU_NEAREST);
+                texLoaded = true;
+            }
+            
+            // copy from linear RAM to VRAM
+            memcpy(albumTex.data, tempArtBuffer, 256 * 256 * 4);
+            
+            linearFree(tempArtBuffer);
+            tempArtBuffer = NULL;
+            newArtReady = false;
+
+            albumSubTex.width = TARGET_IMG_SIZE;
+            albumSubTex.height = TARGET_IMG_SIZE;
+            albumSubTex.left = 0.0f;
+            albumSubTex.top = 1.0f; 
+            albumSubTex.right = TARGET_IMG_SIZE / 256.0f;
+            albumSubTex.bottom = 1.0f - (TARGET_IMG_SIZE / 256.0f);
+
+            albumImg.tex = &albumTex;
+            albumImg.subtex = &albumSubTex;
+        }
+        LightLock_Unlock(&dataLock);
+
+        // fetch display state locally to prevent UI tearing during drawing
+        bool dispPlaying;
+        long dispDurMs, dispProgMs;
+        char dispSong[128], dispArtist[128];
+        int dispNumPlaylists;
+        bool dispLibraryFetched;
+        char dispStatus[256];
+        
+        LightLock_Lock(&dataLock);
+        dispPlaying = isPlaying;
+        dispDurMs = currentDurationMs;
+        dispProgMs = currentProgressMs;
+        strcpy(dispSong, currentSong);
+        strcpy(dispArtist, currentArtist);
+        dispNumPlaylists = numPlaylists;
+        dispLibraryFetched = libraryFetched;
+        strcpy(dispStatus, lastStatus);
+        
+        if (dispPlaying) dispProgMs += (osGetTime() - lastSyncTime);
+        if (dispProgMs > dispDurMs) dispProgMs = dispDurMs;
+        LightLock_Unlock(&dataLock);
 
         // rendering
         C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -979,22 +1370,17 @@ int main(int argc, char **argv) {
         }
 
         char progressDisplay[32] = "0:00 / 0:00";
-        if (currentDurationMs > 0) {
-            long displayMs = currentProgressMs;
-            if (isPlaying) displayMs += (osGetTime() - lastSyncTime);
-            if (displayMs > currentDurationMs) displayMs = currentDurationMs; 
-
-            int p_sec = (displayMs / 1000) % 60;
-            int p_min = (displayMs / 1000) / 60;
-            int d_sec = (currentDurationMs / 1000) % 60;
-            int d_min = (currentDurationMs / 1000) / 60;
-
+        if (dispDurMs > 0) {
+            int p_sec = (dispProgMs / 1000) % 60;
+            int p_min = (dispProgMs / 1000) / 60;
+            int d_sec = (dispDurMs / 1000) % 60;
+            int d_min = (dispDurMs / 1000) / 60;
             sprintf(progressDisplay, "%d:%02d / %d:%02d", p_min, p_sec, d_min, d_sec);
         }
         
-        DrawText(10, 10,  0.5f, clrBlack, "%s", progressDisplay);
+        DrawText(8, 222,  0.5f, clrBlack, "%s", progressDisplay);
         
-        // centered album art 125 = 200 - (150/2) --- 150px by 150px
+        // centered album art
         if (texLoaded) {
             C2D_DrawImageAt(albumImg, 125.0f, 24.0f, 0.5f, NULL, 0.75f, 0.75f);
         }
@@ -1002,9 +1388,8 @@ int main(int argc, char **argv) {
             C2D_DrawImageAt(imgBorder, 114.0f, 16.0f, 0.5f, NULL, 1.0f, 1.0f);
         }
 
-        DrawTextCentered(fontFranxurter, 182, 1.2f, clrBlack, "%.22s", currentSong);
-        DrawTextCentered(NULL, 216, 0.6f, clrBlack, "%.22s", currentArtist);
-        DrawText(10, 220, 0.4f, clrDisabled, "Press START to exit.");
+        DrawTextMarquee(fontFranxurter, 182, 1.0f, clrBlack, 300.0f, "%s", dispSong);
+        DrawTextCentered(NULL, 216, 0.6f, clrBlack, "%.22s", dispArtist);
 
         // ============= BOTTOM SCREEN =================
         C2D_TargetClear(bottomTarget, clrGradBot);
@@ -1016,58 +1401,89 @@ int main(int argc, char **argv) {
         if (currentTab == TAB_PLAYBACK) {
 
             // PLAY BTN
-            if (osGetTime() - playClickedTime < 800) {
+            if (osGetTime() - playClickedTime < 300) {
                 C2D_DrawImageAt(imgControlPlay2, btnPlay.x, btnPlay.y, 0.5f, NULL, 1.0f, 1.0f);
             } else {
                 C2D_DrawImageAt(imgControlPlay, btnPlay.x, btnPlay.y, 0.5f, NULL, 1.0f, 1.0f);
             }
 
             // PAUSE BTN
-            if (osGetTime() - pauseClickedTime < 800) {
+            if (osGetTime() - pauseClickedTime < 300) {
                 C2D_DrawImageAt(imgControlPause2, btnPause.x, btnPause.y, 0.5f, NULL, 1.0f, 1.0f);
             } else {
                 C2D_DrawImageAt(imgControlPause, btnPause.x, btnPause.y, 0.5f, NULL, 1.0f, 1.0f);
             }
 
             // PREV BTN
-            if (osGetTime() - prevClickedTime < 800) {
+            if (osGetTime() - prevClickedTime < 300) {
                 C2D_DrawImageAt(imgControlPrev2, btnPrev.x, btnPrev.y, 0.5f, NULL, 1.0f, 1.0f);
             } else {
                 C2D_DrawImageAt(imgControlPrev, btnPrev.x, btnPrev.y, 0.5f, NULL, 1.0f, 1.0f);
             }
-
+            
             // NEXT BTN
-            if (osGetTime() - nextClickedTime < 800) {
+            if (osGetTime() - nextClickedTime < 300) {
                 C2D_DrawImageAt(imgControlNext2, btnNext.x, btnNext.y, 0.5f, NULL, 1.0f, 1.0f);
             } else {
                 C2D_DrawImageAt(imgControlNext, btnNext.x, btnNext.y, 0.5f, NULL, 1.0f, 1.0f);
             }
             
-        } else if (currentTab == TAB_LIBRARY) {
-            DrawText(10, 10, 0.6f, clrGreen, "Your Playlists");
-            
-            if (!libraryFetched) {
-                DrawText(10, 50, 0.5f, clrDisabled, "Loading...");
-            } else if (numPlaylists == 0) {
-                DrawText(10, 50, 0.5f, clrDisabled, "No playlists found. Tap tab to retry.");
+        } else if (currentTab == TAB_LIBRARY) {            
+            if (!dispLibraryFetched) {
+                C2D_DrawText(&txtLoading, C2D_WithColor, 10, 10, 0.5f, 0.5f, 0.5f, clrDisabled);
+            } else if (dispNumPlaylists == 0) {
+                C2D_DrawText(&txtNoPlaylists, C2D_WithColor, 10, 10, 0.5f, 0.5f, 0.5f, clrDisabled);
             } else {
-                int displayCount = (numPlaylists - listScrollOffset < VISIBLE_ITEMS) ? (numPlaylists - listScrollOffset) : VISIBLE_ITEMS;
+                LightLock_Lock(&dataLock);
 
-                if (numPlaylists > VISIBLE_ITEMS) {
-                    DrawText(150, 10, 0.4f, clrDisabled, "(Up/Down: Scroll)"); 
-                    DrawText(220, 25, 0.45f, clrGreen, "%d-%d / %d", listScrollOffset + 1, listScrollOffset + displayCount, numPlaylists);
+                for (int i = 0; i < dispNumPlaylists; i++) {
+                    float yPos = LIST_START_Y + (i * ROW_HEIGHT) - listScrollPixels;
+                    
+                    if (yPos + ROW_HEIGHT > 0 && yPos < LIST_END_Y) {
+                        
+                        if (libraryUiLoaded) {
+                            C2D_DrawImageAt(imgPlaylistBar, 8, yPos, 0.5f, NULL, 0.42f, 0.42f);
+                        }
+
+                        C2D_Text playlistText;
+                        char buf[64];
+                        if (strlen(userPlaylists[i].name) > 32) {
+                            snprintf(buf, sizeof(buf), "%.32s...", userPlaylists[i].name);
+                        } else {
+                            snprintf(buf, sizeof(buf), "%s", userPlaylists[i].name);
+                        }
+                        
+                        sanitizeText(buf);
+
+                        C2D_TextParse(&playlistText, g_dynamicBuf, buf);
+                        C2D_TextOptimize(&playlistText);
+                        
+                        C2D_DrawText(&playlistText, C2D_WithColor, 44, yPos + 10, 0.5f, 0.6f, 0.6f, clrPlaylistText);
+                    }
                 }
+                LightLock_Unlock(&dataLock);
 
-                for (int i = 0; i < displayCount; i++) {
-                    int actualDataIndex = listScrollOffset + i;
-                    int yPos = 45 + (i * 26);
-                    C2D_DrawRectSolid(10, yPos, 0.5f, 300, 22, clrBtnBg);
-                    DrawText(15, yPos + 3, 0.45f, clrGreen, "> %.40s", userPlaylists[actualDataIndex].name);
+                // calculate and draw scrollbar
+                float maxScrollPixelsRender = (dispNumPlaylists * ROW_HEIGHT) - VISIBLE_HEIGHT;
+                if (maxScrollPixelsRender > 0) {
+                    float scrollRatio = listScrollPixels / maxScrollPixelsRender;
+                    
+                    float paddingTop = 4.0f;
+                    
+                    float adjustedVisibleHeight = VISIBLE_HEIGHT - paddingTop;
+
+                    float thumbHeight = (VISIBLE_HEIGHT / (dispNumPlaylists * ROW_HEIGHT)) * VISIBLE_HEIGHT;
+                    if (thumbHeight < 20.0f) thumbHeight = 20.0f; 
+                    
+                    float thumbY = LIST_START_Y + paddingTop + (scrollRatio * (adjustedVisibleHeight - thumbHeight));
+                    
+                    C2D_DrawRectSolid(313, LIST_START_Y + paddingTop, 0.5f, 4, adjustedVisibleHeight, clrDisabled);
+                    
+                    C2D_DrawRectSolid(312, thumbY, 0.5f, 6, thumbHeight, clrGreen);
                 }
             }
         } else if (currentTab == TAB_SETTINGS) {
-            // settings tab
-            DrawText(10, 10, 0.6f, clrGreen, "Settings & Debug");
+            C2D_DrawText(&txtTitleSettings, C2D_WithColor, 10, 10, 0.5f, 0.6f, 0.6f, clrGreen);
 
             char displayToken[25] = "";
             if(strlen(currentAccessToken) > 0) {
@@ -1076,30 +1492,42 @@ int main(int argc, char **argv) {
                 strcpy(displayToken, "None");
             }
             
-            DrawText(10, 40, 0.45f, clrGreen, "Token: %.18s", displayToken);
-            DrawText(10, 60, 0.45f, clrGreen, "Play State: %s", isPlaying ? "Playing" : "Paused");
-            DrawText(10, 80, 0.45f, clrGreen, "API Status: %.35s", lastStatus);
+            DrawText(10, 40, 0.45f, clrGreen, "Play State: %s", dispPlaying ? "Playing" : "Paused");
+            DrawText(10, 60, 0.45f, clrGreen, "API Status: %.35s", dispStatus);
+            DrawText(10, 80, 0.45f, clrGreen, "Token: %.18s", displayToken);
+            
+            LightLock_Lock(&dataLock);
             DrawText(10, 100, 0.45f, clrGreen, "Art URL: %.35s", debugUrl);
+            LightLock_Unlock(&dataLock);
         }
 
         // render tabs
         float activeOffset = 4.0f;
-        // Playback Tab
+        // Playback
         C2D_DrawImageAt(imgTabPlayback, btnTabPlayback.x, 
                         currentTab == TAB_PLAYBACK ? btnTabPlayback.y - activeOffset : btnTabPlayback.y, 
                         0.5f, NULL, 1.0f, 1.0f);
 
-        // Library Tab
+        // Library
         C2D_DrawImageAt(imgTabLibrary, btnTabLibrary.x, 
                         currentTab == TAB_LIBRARY ? btnTabLibrary.y - activeOffset : btnTabLibrary.y, 
                         0.5f, NULL, 1.0f, 1.0f);
 
-        // Settings Tab
+        // Settings
         C2D_DrawImageAt(imgTabSettings, btnTabSettings.x, 
                         currentTab == TAB_SETTINGS ? btnTabSettings.y - activeOffset : btnTabSettings.y, 
                         0.5f, NULL, 1.0f, 1.0f);
         
         C3D_FrameEnd(0);
+    }
+
+    // Shut down background thread
+    exitThread = true;
+    threadJoin(networkThread, U64_MAX);
+    threadFree(networkThread);
+
+    if (tempArtBuffer) {
+        linearFree(tempArtBuffer);
     }
 
     if (texLoaded) {
@@ -1110,6 +1538,7 @@ int main(int argc, char **argv) {
     }
     
     C2D_TextBufDelete(g_dynamicBuf);
+    C2D_TextBufDelete(g_staticBuf);
     C2D_Fini();
     C3D_Fini();
     
@@ -1118,7 +1547,7 @@ int main(int argc, char **argv) {
         C3D_TexDelete(&tabTexLibrary);
         C3D_TexDelete(&tabTexSettings);
     }
-    // Free control textures
+
     if (controlImagesLoaded) {
         C3D_TexDelete(&texControlPlay);
         C3D_TexDelete(&texControlPause);
@@ -1132,6 +1561,9 @@ int main(int argc, char **argv) {
     }
     if (borderLoaded) {
         C3D_TexDelete(&texBorder);
+    }
+    if (libraryUiLoaded) {
+        C3D_TexDelete(&texPlaylistBar);
     }
     
     romfsExit();
