@@ -1,7 +1,7 @@
 <br>
 
 <p align="center">
- <img src="https://github.com/ssambender/3DSpotify/blob/main/3dspotify%20transparent.png?raw=true" alt="3DSpotify Logo" height="165">
+  <img src="./3dspotify%20transparent.png" alt="3DSpotify Logo" height="165">
 </p>
 
 <h3 align="center">3DSpotify | Playback controller</h3>
