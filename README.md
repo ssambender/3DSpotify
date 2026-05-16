@@ -9,7 +9,7 @@
 <p align="center">
 Spotify API controller software for 3DS
  <br>
- <a href="sambender.net"><strong>Install Instructions »</strong></a>
+ <a href="https://ssambender.github.io/3DSpotify-Install/"><strong>Install Instructions »</strong></a>
 </p>
 
 ___
